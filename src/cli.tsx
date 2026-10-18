@@ -31,7 +31,9 @@ const HELP = `anonymus — автоматическая синхронизаци
                                       новая ветка (от текущей или --from) + подпесочница;
                                       --no-switch: проект не переключать, папку заполнить из ветки
   anonymus sandbox switch <имя>       переключить проект на ветку подпесочницы
-  anonymus sandbox remove <имя>       удалить подпесочницу (папка в корзину)
+  anonymus sandbox remove <имя> [--drop-stash]
+                                      удалить подпесочницу (папка в корзину);
+                                      --drop-stash: удалить и stash её ветки
 
 Слияние работы нескольких агентов:
   anonymus merge <цель> [<источник>...]
@@ -55,6 +57,7 @@ interface Args {
   sandboxName?: string;
   from?: string;
   noSwitch?: boolean;
+  dropStash?: boolean;
   mergeTarget?: string;
   mergeSources?: string[];
   message?: string;
@@ -111,6 +114,8 @@ function parseArgs(argv: string[]): Args {
       args.command = "commit";
     } else if (a === "--from") {
       args.from = argv[++i];
+    } else if (a === "--drop-stash") {
+      args.dropStash = true;
     } else if (a === "--no-switch") {
       args.noSwitch = true;
     } else if (a === "-m" || a === "--message") {
@@ -218,7 +223,11 @@ function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: st
     } else if (action === "switch") {
       warnings = workspace.switchTo(name, step);
     } else {
-      warnings = workspace.remove(name, step).warnings;
+      const removed = workspace.remove(name, step, { dropStash: args.dropStash });
+      warnings = removed.warnings;
+      if (removed.stashDropped) {
+        console.log("  … stash ветки удалён");
+      }
     }
     warnings.forEach((w) => console.log(`⚠ ${w}`));
     console.log("готово.");

@@ -16,7 +16,7 @@ type Mode =
   | { kind: "list" }
   | { kind: "new"; value: string; base: number; error: string | null }
   | { kind: "new-confirm"; name: string; from: string }
-  | { kind: "confirm-delete"; name: string }
+  | { kind: "confirm-delete"; name: string; hasStash: boolean }
   | { kind: "confirm-switch"; name: string }
   | { kind: "merge"; target: string; sources: string[]; picked: Set<string>; index: number }
   | { kind: "commit"; value: string };
@@ -42,7 +42,7 @@ export function SandboxesView({
   maxItems: number;
   onSwitch: (name: string) => void;
   onCreate: (name: string, from: string, switchTo: boolean) => ActionResult | void;
-  onRemove: (name: string) => ActionResult;
+  onRemove: (name: string, dropStash: boolean) => ActionResult;
   onPrepareMerge: (target: string, sources: string[]) => ActionResult;
   onCommit: (message: string) => ActionResult;
   onBack: () => void;
@@ -90,14 +90,22 @@ export function SandboxesView({
   // List and simple confirmations.
   useInput(
     (input, key) => {
-      if (mode.kind === "confirm-delete" || mode.kind === "confirm-switch") {
+      if (mode.kind === "confirm-delete") {
+        // y — delete (together with the branch's stash, if it has one);
+        // o — delete but keep the stash; n / Esc — cancel.
+        const keepStash = mode.hasStash && (input === "o" || input === "щ");
+        if (input === "y" || input === "н" || key.return || keepStash) {
+          show(onRemove(mode.name, mode.hasStash && !keepStash));
+          setIndex((i) => Math.max(0, Math.min(i, list.length - 2)));
+          setMode({ kind: "list" });
+        } else if (input === "n" || input === "т" || key.escape) {
+          setMode({ kind: "list" });
+        }
+        return;
+      }
+      if (mode.kind === "confirm-switch") {
         if (input === "y" || input === "н" || key.return) {
-          if (mode.kind === "confirm-delete") {
-            show(onRemove(mode.name));
-            setIndex((i) => Math.max(0, Math.min(i, list.length - 2)));
-          } else {
-            onSwitch(mode.name);
-          }
+          onSwitch(mode.name);
           setMode({ kind: "list" });
         } else if (input === "n" || input === "т" || key.escape) {
           setMode({ kind: "list" });
@@ -152,7 +160,7 @@ export function SandboxesView({
         if (selected.name === activeName) {
           show({ ok: false, lines: ["активную подпесочницу удалить нельзя — сначала переключитесь на другую"] });
         } else {
-          setMode({ kind: "confirm-delete", name: selected.name });
+          setMode({ kind: "confirm-delete", name: selected.name, hasStash: workspace.hasStash(selected.name) });
         }
       } else if (input === "m" || input === "ь") {
         startMerge();
@@ -299,9 +307,22 @@ export function SandboxesView({
           <Text color={theme.warn}>
             Удалить подпесочницу «{mode.name}»? Папка уйдёт в .anonymus/trash, git-ветка останется.
           </Text>
-          <Text>
-            <Text color={theme.accent}>y</Text> удалить · <Text color={theme.accent}>n</Text> отмена
-          </Text>
+          {mode.hasStash ? (
+            <>
+              <Text color={theme.warn}>
+                У её ветки есть незакоммиченная работа в git stash — после удаления подпесочницы её уже
+                никто не вернёт.
+              </Text>
+              <Text>
+                <Text color={theme.accent}>y</Text> удалить вместе со stash · <Text color={theme.accent}>o</Text>{" "}
+                удалить, stash оставить · <Text color={theme.accent}>n</Text> отмена
+              </Text>
+            </>
+          ) : (
+            <Text>
+              <Text color={theme.accent}>y</Text> удалить · <Text color={theme.accent}>n</Text> отмена
+            </Text>
+          )}
         </Box>
       )}
 

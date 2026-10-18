@@ -291,7 +291,11 @@ export class Workspace {
    * Remove a sub-sandbox: its folder and sync state go to the trash, the git
    * branch stays. The active one cannot be removed.
    */
-  remove(name: string, step: StepReporter = () => {}): { trashDir: string; warnings: string[] } {
+  remove(
+    name: string,
+    step: StepReporter = () => {},
+    options: { dropStash?: boolean } = {}
+  ): { trashDir: string; warnings: string[]; stashDropped: boolean } {
     const entry = this.registry.get(name);
     if (!entry) {
       throw new Error(`нет подпесочницы «${name}»`);
@@ -313,12 +317,28 @@ export class Workspace {
     if (fs.existsSync(stateDir)) {
       moveDir(stateDir, uniquePath(path.join(trashDir, `${path.basename(folder)}.state`)));
     }
+    let stashDropped = false;
     if (entry.stash) {
-      warnings.push(`у ветки ${entry.branch} остался stash «${entry.stash}» — он в git stash list`);
+      const ref = this.git?.findStash(entry.stash) ?? null;
+      if (!ref) {
+        // Already gone (applied or dropped by hand): nothing to keep or remove.
+      } else if (options.dropStash) {
+        step(`удаляю stash ветки ${entry.branch}`);
+        this.git!.stashDrop(ref);
+        stashDropped = true;
+      } else {
+        warnings.push(`у ветки ${entry.branch} остался stash «${entry.stash}» — он в git stash list`);
+      }
     }
     this.registry.remove(entry.name);
     this.registry.save();
-    return { trashDir, warnings };
+    return { trashDir, warnings, stashDropped };
+  }
+
+  /** Does this sub-sandbox have stashed uncommitted work that still exists in git? */
+  hasStash(name: string): boolean {
+    const entry = this.registry.get(name);
+    return !!(entry?.stash && this.git?.findStash(entry.stash));
   }
 }
 

@@ -143,6 +143,31 @@ describe("Workspace: sub-sandboxes per branch", () => {
     expect(bench.git("branch", "--list", "feature")).toContain("feature");
   });
 
+  it("removes a sub-sandbox together with its branch's stash, or keeps the stash on request", () => {
+    const ws = setup();
+    ws.create("keep");
+    bench.write("project", "BIGcorpProject/main.c", "int v = 2; // keep\n");
+    ws.create("drop"); // switching away from `keep` stashes its work
+    bench.write("project", "BIGcorpProject/main.c", "int v = 3; // drop\n");
+    ws.switchTo("default"); // ...and `drop`'s work too
+    expect(ws.hasStash("keep")).toBe(true);
+    expect(ws.hasStash("drop")).toBe(true);
+    expect(bench.git("stash", "list").split("\n")).toHaveLength(2);
+
+    const kept = ws.remove("keep");
+    expect(kept.stashDropped).toBe(false);
+    expect(kept.warnings[0]).toMatch(/остался stash/);
+
+    const dropped = ws.remove("drop", () => {}, { dropStash: true });
+    expect(dropped.stashDropped).toBe(true);
+    expect(dropped.warnings).toEqual([]);
+
+    const remaining = bench.git("stash", "list");
+    expect(remaining).toContain("anonymus:keep:");
+    expect(remaining).not.toContain("anonymus:drop:");
+    expect(bench.git("branch", "--list", "drop")).toContain("drop"); // the branch itself stays
+  });
+
   it("allows only one running instance per project, whatever the profile", () => {
     bench = makeBench();
     const dir = path.join(bench.project, ".anonymus");

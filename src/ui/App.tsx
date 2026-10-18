@@ -282,12 +282,16 @@ export function App({
     [runSwitch, workspace, attempt, info]
   );
   const removeSandbox = useCallback(
-    (name: string): ActionResult =>
+    (name: string, dropStash: boolean): ActionResult =>
       attempt(() => {
-        const { trashDir, warnings: w } = workspace.remove(name);
+        const { trashDir, warnings: w, stashDropped } = workspace.remove(name, () => {}, { dropStash });
         w.forEach(warn);
-        info(`подпесочница «${name}» удалена (папка в ${path.relative(workspace.config.projectRoot, trashDir)}), ветка оставлена`);
-        return { ok: true, lines: [`«${name}» удалена, папка в корзине`, ...w] };
+        const stashNote = stashDropped ? ", её stash удалён" : "";
+        info(
+          `подпесочница «${name}» удалена (папка в ${path.relative(workspace.config.projectRoot, trashDir)}), ` +
+            `ветка оставлена${stashNote}`
+        );
+        return { ok: true, lines: [`«${name}» удалена, папка в корзине${stashNote}`, ...w] };
       }),
     [workspace, attempt, warn, info]
   );
