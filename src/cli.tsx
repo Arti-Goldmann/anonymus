@@ -12,6 +12,7 @@ import { applyReconcile, planReconcile, type Strategy } from "./core/reconcile.j
 import { KIND_LABEL, scan } from "./core/scanner.js";
 import { Syncer } from "./core/syncer.js";
 import { App } from "./ui/App.js";
+import { flickerFreeStdout } from "./ui/frameStdout.js";
 import { formatTime } from "./ui/theme.js";
 
 const HELP = `anonymus — автоматическая синхронизация проекта и песочницы с анонимизацией
@@ -210,7 +211,9 @@ async function main(): Promise<void> {
   process.on("exit", leaveAltScreen);
 
   const app = render(<App engine={engine} version={version()} warnings={warnings} />, {
+    stdout: flickerFreeStdout(process.stdout),
     exitOnCtrlC: false,
+    patchConsole: false,
   });
   await app.waitUntilExit();
   leaveAltScreen();
