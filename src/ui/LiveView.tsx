@@ -1,6 +1,6 @@
 import { Box, Text } from "ink";
 import Spinner from "ink-spinner";
-import type { SyncEvent, SyncEventKind } from "../core/syncer.js";
+import type { BranchChange, SyncEvent, SyncEventKind } from "../core/syncer.js";
 import { formatTime, plural, theme } from "./theme.js";
 
 const ICON: Record<SyncEventKind, { icon: string; color: string }> = {
@@ -48,6 +48,8 @@ export function LiveView({
   stats,
   logRows,
   logPath,
+  branchChange = null,
+  adoptTarget = null,
 }: {
   status: LiveStatus;
   events: SyncEvent[];
@@ -55,17 +57,29 @@ export function LiveView({
   stats: { toSandbox: number; toProject: number; deleted: number };
   logRows: number;
   logPath: string;
+  /** The branch was switched outside anonymus; sync is stopped until the user picks. */
+  branchChange?: BranchChange | null;
+  /** Sub-sandbox of the branch now checked out (offered with s), if any. */
+  adoptTarget?: string | null;
 }) {
   const shown = events.slice(-Math.max(1, logRows));
   const held = heldCount > 0;
-  // Priority of what the frame says: pause > files waiting for a decision > work in progress > idle.
-  const borderColor = status.paused ? theme.warn : held ? theme.error : theme.accent;
+  // Priority of what the frame says: foreign checkout > pause > files waiting for a decision > work in progress > idle.
+  const borderColor = branchChange ? theme.error : status.paused ? theme.warn : held ? theme.error : theme.accent;
+  const back = branchChange !== null && branchChange.actual === branchChange.expected;
+  const actualName = branchChange?.actual ?? "отделённый HEAD";
   return (
     <Box flexDirection="column" flexGrow={1}>
       <Box borderStyle="round" borderColor={borderColor} paddingX={1} flexShrink={0}>
         {/* The status (especially "files waiting") must stay readable; the counters give way. */}
         <Box flexGrow={1} flexShrink={0}>
-          {status.paused ? (
+          {branchChange ? (
+            <Text color={theme.error} wrap="truncate-end">
+              {back
+                ? `⚠ ветка снова ${branchChange.expected} — x, чтобы продолжить синхронизацию`
+                : `⚠ ветка сменилась вне anonymus: ${branchChange.expected} → ${actualName} — синхронизация остановлена`}
+            </Text>
+          ) : status.paused ? (
             <Text color={theme.warn} wrap="truncate-end">⏸ пауза — изменения копятся до нажатия p</Text>
           ) : held ? (
             <Text color={theme.error} wrap="truncate-end">
@@ -100,9 +114,24 @@ export function LiveView({
       </Box>
 
       <Box paddingX={1} flexShrink={0}>
-        <Text color={theme.muted} wrap="truncate-end">
-          c конфликты · b ветки · p {status.paused ? "продолжить" : "пауза"} · r пересканировать · o корзина · q выход
-        </Text>
+        {branchChange ? (
+          <Text wrap="truncate-end">
+            {!back &&
+              (adoptTarget ? (
+                <Text>
+                  <Text color={theme.accent}>s</Text> подпесочница «{adoptTarget}» ·{" "}
+                </Text>
+              ) : (
+                <Text color={theme.muted}>у {actualName} нет подпесочницы · </Text>
+              ))}
+            <Text color={theme.accent}>x</Text> {back ? "продолжить" : `git checkout ${branchChange.expected}`} ·{" "}
+            <Text color={theme.accent}>q</Text> выход
+          </Text>
+        ) : (
+          <Text color={theme.muted} wrap="truncate-end">
+            c конфликты · b ветки · p {status.paused ? "продолжить" : "пауза"} · r пересканировать · o корзина · q выход
+          </Text>
+        )}
       </Box>
     </Box>
   );

@@ -267,13 +267,18 @@ async function runHeadless(engine: SyncEngine, warnings: string[], strategy?: St
 
   const syncer = new Syncer(engine, held);
   syncer.on("event", (e) => log(`${e.kind.padEnd(10)} ${e.message}`));
-  await syncer.start();
-  const stop = () => {
+  const stop = (code = 0) => {
     log("останавливаюсь…");
-    void syncer.stop().then(() => process.exit(0));
+    void syncer.stop().then(() => process.exit(code));
   };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  // A checkout done outside anonymus: nobody to ask what to do, so stop.
+  syncer.once("branch", ({ expected }) => {
+    log(`верните ветку (git checkout ${expected}) или переключите подпесочницу и запустите anonymus снова`);
+    stop(1);
+  });
+  await syncer.start();
+  process.on("SIGINT", () => stop());
+  process.on("SIGTERM", () => stop());
 }
 
 async function main(): Promise<void> {

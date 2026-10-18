@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { SERVICE_DIR } from "../config/schema.js";
 
 /** A git command failed; `message` is ready to show to the user. */
@@ -7,6 +9,27 @@ export class GitError extends Error {
     super(message);
     this.name = "GitError";
   }
+}
+
+/**
+ * Branch named in a HEAD file, read directly — cheap enough to poll every
+ * second, unlike spawning git. Null for a detached HEAD; undefined when the
+ * file cannot be read (git is rewriting it right now).
+ */
+export function readHeadBranch(gitDir: string): string | null | undefined {
+  let head: string;
+  try {
+    head = fs.readFileSync(path.join(gitDir, "HEAD"), "utf8").trim();
+  } catch {
+    return undefined;
+  }
+  const m = /^ref:\s*refs\/heads\/(.+)$/.exec(head);
+  return m ? m[1] : null;
+}
+
+/** A git command (checkout, merge, stash…) holds the index right now. */
+export function gitBusy(gitDir: string): boolean {
+  return fs.existsSync(path.join(gitDir, "index.lock"));
 }
 
 /** Paths anonymus itself writes in the project; they never make it "dirty". */
@@ -59,6 +82,11 @@ export class Git {
     } catch {
       return null;
     }
+  }
+
+  /** Absolute path of the repository's .git folder (also for worktrees). */
+  gitDir(): string {
+    return this.run(["rev-parse", "--absolute-git-dir"]);
   }
 
   branchExists(name: string): boolean {

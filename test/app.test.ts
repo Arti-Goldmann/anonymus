@@ -131,3 +131,63 @@ describe("App: sub-sandbox workflow end to end", () => {
     );
   }, 60000);
 });
+
+describe("App: branch switched outside anonymus", () => {
+  let bench: Bench;
+  let unmount: (() => void) | null = null;
+  afterEach(async () => {
+    unmount?.();
+    unmount = null;
+    await new Promise((r) => setTimeout(r, 200)); // let watchers close
+    bench?.cleanup();
+  });
+
+  it("stops sync, then switches to that branch's sub-sandbox or checks the branch out back", async () => {
+    bench = makeBench();
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
+    bench.gitInit();
+    const ws = new Workspace(bench.config());
+    ws.reconcileWithGit();
+    ws.create("feature", { switchTo: false });
+    bench.git("checkout", "--quiet", "-b", "loose"); // a branch without a sub-sandbox
+    bench.git("checkout", "--quiet", "master");
+
+    const out = new FakeStdout();
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
+    const app = render(React.createElement(App, { workspace: ws, version: "test", warnings: [] }), {
+      stdout: out as never,
+      stdin: stdin as never,
+      patchConsole: false,
+      exitOnCtrlC: false,
+    });
+    unmount = () => app.unmount();
+    const press = (keys: string) => stdin.write(keys);
+    (globalThis as { __screen?: () => string }).__screen = () => out.screen;
+    await until(() => out.screen.includes("синхронизация активна"), "live sync");
+
+    // s: adopt the sub-sandbox of the branch checked out by hand.
+    bench.git("checkout", "--quiet", "feature");
+    await until(() => out.screen.includes("ветка сменилась вне anonymus: master → feature"), "branch-change frame");
+    expect(out.screen).toContain("s подпесочница «feature»");
+    press("s");
+    await until(
+      () => out.screen.includes("feature ⎇ feature") && out.screen.includes("синхронизация активна"),
+      "switched to feature"
+    );
+    expect(ws.active.name).toBe("feature");
+
+    // x: no sub-sandbox for `loose` — put feature back.
+    bench.git("checkout", "--quiet", "loose");
+    await until(() => out.screen.includes("ветка сменилась вне anonymus: feature → loose"), "second frame");
+    expect(out.screen).toContain("у loose нет подпесочницы");
+    press("s"); // not offered: nothing happens
+    await new Promise((r) => setTimeout(r, 300));
+    press("x");
+    await until(
+      () => out.screen.includes("feature ⎇ feature") && out.screen.includes("синхронизация активна"),
+      "feature checked out back"
+    );
+    expect(bench.git("branch", "--show-current")).toBe("feature");
+    expect(ws.active.name).toBe("feature");
+  }, 60000);
+});

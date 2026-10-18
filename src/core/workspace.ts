@@ -67,7 +67,7 @@ export class Workspace {
     if (active.branch === null) {
       active.branch = branch;
     } else if (active.branch !== branch) {
-      const match = this.registry.list().find((s) => s.branch === branch);
+      const match = this.sandboxOfBranch(branch);
       if (match) {
         this.registry.setActive(match.name);
         notices.push({
@@ -86,6 +86,29 @@ export class Workspace {
     }
     this.registry.save();
     return notices;
+  }
+
+  /** The sub-sandbox tied to a branch, if there is one. */
+  sandboxOfBranch(branch: string | null): SandboxEntry | undefined {
+    return branch === null ? undefined : this.registry.list().find((s) => s.branch === branch);
+  }
+
+  /**
+   * Undo a `git checkout` made outside anonymus: put the active sub-sandbox's
+   * branch back. Uncommitted changes travel with the checkout as git allows;
+   * if git refuses, the error says why and nothing changes.
+   */
+  checkoutActiveBranch(step: StepReporter = () => {}): string[] {
+    const branch = this.registry.active.branch;
+    if (!this.git || !branch) {
+      throw new Error("у активной подпесочницы нет git-ветки");
+    }
+    if (this.git.currentBranch() !== branch) {
+      step(`git checkout ${branch}`);
+      this.git.checkout(branch);
+    }
+    this.branchMismatch = false;
+    return [];
   }
 
   /** Folder a new sub-sandbox would get (placeholder names only). */

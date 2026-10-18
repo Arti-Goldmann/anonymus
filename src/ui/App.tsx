@@ -7,7 +7,7 @@ import { SERVICE_DIR } from "../config/schema.js";
 import type { FileStatus, SyncEngine } from "../core/engine.js";
 import { applyReconcile, planReconcile, summarize, type Strategy } from "../core/reconcile.js";
 import { scan, type ScanResult } from "../core/scanner.js";
-import { Syncer, type SyncEvent } from "../core/syncer.js";
+import { Syncer, type BranchChange, type SyncEvent } from "../core/syncer.js";
 import type { Workspace } from "../core/workspace.js";
 import { openFolder } from "../platform.js";
 import { ConflictView } from "./ConflictView.js";
@@ -73,6 +73,8 @@ export function App({
   const [status, setStatus] = useState<LiveStatus>({ paused: false, busy: false, pending: 0 });
   const [stats, setStats] = useState({ toSandbox: 0, toProject: 0, deleted: 0 });
   const [fatal, setFatal] = useState<string | null>(null);
+  // Set when the branch was switched outside anonymus: sync stays stopped until the user picks.
+  const [branchChange, setBranchChange] = useState<BranchChange | null>(null);
   // The mascot stays on the live screen until the first file moves.
   const [folded, setFolded] = useState(false);
   const syncerRef = useRef<Syncer | null>(null);
@@ -109,6 +111,20 @@ export function App({
   const info = useCallback((message: string) => pushEvent({ time: now(), kind: "info", message }), [pushEvent]);
   const warn = useCallback((message: string) => pushEvent({ time: now(), kind: "warning", message }), [pushEvent]);
 
+  /** First notice of a foreign checkout: leave screens that would write files, explain. */
+  const onForeignCheckout = useCallback(() => {
+    setScreen((s) => (s === "conflicts" ? "live" : s));
+    let dirty = false;
+    try {
+      dirty = workspace.git?.isDirty() ?? false;
+    } catch {
+      // Only a hint; the choice is the user's anyway.
+    }
+    if (dirty) {
+      warn("в проекте есть незакоммиченные изменения — git перенёс их при checkout; при переключении подпесочницы они попадут в неё");
+    }
+  }, [workspace, warn]);
+
   const startLive = useCallback(
     async (eng: SyncEngine, initiallyHeld: FileStatus[]) => {
       const syncer = new Syncer(eng, initiallyHeld);
@@ -116,11 +132,19 @@ export function App({
       syncer.on("event", pushEvent);
       syncer.on("held", setHeld);
       syncer.on("state", setStatus);
+      let noticed = false;
+      syncer.on("branch", (change) => {
+        setBranchChange(change);
+        if (!noticed) {
+          noticed = true;
+          onForeignCheckout();
+        }
+      });
       setHeld(syncer.getHeld());
       setScreen("live");
       await syncer.start();
     },
-    [pushEvent]
+    [pushEvent, onForeignCheckout]
   );
 
   const reportOutcome = useCallback(
@@ -152,6 +176,7 @@ export function App({
       engineRef.current = eng;
       setEngine(eng);
       setScanResult(null);
+      setBranchChange(null);
       setHeld([]);
       setStats({ toSandbox: 0, toProject: 0, deleted: 0 });
       setProgress([0, 0]);
@@ -338,6 +363,23 @@ export function App({
     void stopSyncer().finally(() => exit());
   }, [exit, stopSyncer]);
 
+  /** After a foreign checkout: the sub-sandbox of the branch now checked out, if any. */
+  const branchTarget = branchChange ? workspace.sandboxOfBranch(branchChange.actual) : undefined;
+  const adoptTarget = branchTarget && branchTarget.name !== workspace.active.name ? branchTarget : undefined;
+
+  /** After a foreign checkout: put the active sub-sandbox's branch back, then sync again. */
+  const checkoutBack = useCallback(() => {
+    const branch = workspace.active.branch;
+    try {
+      // The syncer is stopped for good and drops every event meanwhile.
+      workspace.checkoutActiveBranch();
+    } catch (e) {
+      pushEvent({ time: now(), kind: "error", message: (e as Error).message });
+      return;
+    }
+    void runSwitch(`ветка ${branch} возвращена`, () => []);
+  }, [workspace, pushEvent, runSwitch]);
+
   // Ctrl-C always stops cleanly (state saved), whatever screen is shown.
   useInput((input, key) => {
     if (key.ctrl && input === "c" && screen !== "stopping") {
@@ -350,6 +392,13 @@ export function App({
       const s = syncerRef.current;
       if (input === "q" || input === "й") {
         quit();
+      } else if (branchChange) {
+        // Only the choices of the branch-change frame; nothing syncs until one is made.
+        if ((input === "s" || input === "ы") && adoptTarget) {
+          switchTo(adoptTarget.name);
+        } else if (input === "x" || input === "ч") {
+          checkoutBack();
+        }
       } else if ((input === "c" || input === "с") && s) {
         setScreen("conflicts");
       } else if (input === "b" || input === "и") {
@@ -429,6 +478,8 @@ export function App({
             stats={stats}
             logRows={bodyRows - LIVE_CHROME_ROWS}
             logPath={journal}
+            branchChange={branchChange}
+            adoptTarget={adoptTarget?.name ?? null}
           />
         )}
 

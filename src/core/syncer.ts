@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { watch, type FSWatcher } from "chokidar";
 import type { FileStatus, SyncEngine, TransferResult } from "./engine.js";
+import { Git, gitBusy, readHeadBranch } from "./git.js";
 import { mergeInEditor } from "./merge.js";
 import { toPosixRelative, type Side } from "./paths.js";
 
@@ -26,13 +27,28 @@ export interface SyncEvent {
 
 export type Resolution = "project" | "sandbox" | "editor";
 
+/** The project's branch was switched outside anonymus while syncing. */
+export interface BranchChange {
+  /** Branch of the active sub-sandbox. */
+  expected: string;
+  /** Branch now checked out; null for a detached HEAD. */
+  actual: string | null;
+}
+
 interface SyncerEvents {
   event: [SyncEvent];
   held: [FileStatus[]];
   state: [{ paused: boolean; busy: boolean; pending: number }];
+  branch: [BranchChange];
 }
 
 const MAX_RETRIES = 5;
+/** How often .git/HEAD is checked while idle (every batch checks it too). */
+const BRANCH_POLL_MS = 1000;
+/** Retry delay while another git command holds .git/index.lock. */
+const GIT_WAIT_MS = 200;
+/** After this long behind index.lock, say in the log why nothing moves. */
+const GIT_WAIT_REPORT_MS = 5000;
 
 /**
  * Live two-way sync. Watcher events only mark a canonical path as dirty; a
@@ -43,6 +59,14 @@ const MAX_RETRIES = 5;
  *
  * Files that need a human (conflicts, unknown differences) are "held": they
  * are not touched automatically until resolved.
+ *
+ * Branch guard: a sub-sandbox belongs to one branch. A `git checkout` done
+ * outside anonymus rewrites the project, and the watcher would copy the other
+ * branch into this sandbox. So HEAD is checked every second and before every
+ * file; while git holds the index (a checkout in progress) nothing is applied.
+ * Once HEAD differs, sync stops for good: queued events are dropped (they come
+ * from the checkout, not from edits) and `branch` is emitted. The caller
+ * decides what to do and starts a new Syncer.
  */
 export class Syncer extends EventEmitter<SyncerEvents> {
   private watchers: FSWatcher[] = [];
@@ -54,12 +78,29 @@ export class Syncer extends EventEmitter<SyncerEvents> {
   private running = false;
   private paused = false;
   private stopped = false;
+  /** .git folder of the project, when the profile is tied to a branch. */
+  private gitDir: string | null = null;
+  private branchTimer: NodeJS.Timeout | null = null;
+  private branchChange: BranchChange | null = null;
+  private gitBusySince = 0;
 
   constructor(private readonly engine: SyncEngine, initiallyHeld: FileStatus[] = []) {
     super();
     for (const s of initiallyHeld) {
       this.held.set(s.canonical, s);
     }
+    if (engine.config.profile.branch) {
+      try {
+        this.gitDir = new Git(engine.projectRoot).gitDir();
+      } catch {
+        // Not a git repo (or no git): nothing to guard.
+      }
+    }
+  }
+
+  /** Set once the branch was switched outside anonymus; sync stays stopped. */
+  getBranchChange(): BranchChange | null {
+    return this.branchChange;
   }
 
   getHeld(): FileStatus[] {
@@ -71,6 +112,11 @@ export class Syncer extends EventEmitter<SyncerEvents> {
   }
 
   async start(): Promise<void> {
+    if (this.gitDir) {
+      this.checkBranch();
+      this.branchTimer = setInterval(() => this.checkBranch(), BRANCH_POLL_MS);
+      this.branchTimer.unref();
+    }
     const ready = (["project", "sandbox"] as Side[]).map((side) => this.watchSide(side));
     await Promise.all(ready);
     this.info("слежу за изменениями в проекте и песочнице");
@@ -82,6 +128,9 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     this.stopped = true;
     if (this.timer) {
       clearTimeout(this.timer);
+    }
+    if (this.branchTimer) {
+      clearInterval(this.branchTimer);
     }
     await Promise.all(this.watchers.map((w) => w.close()));
     this.watchers = [];
@@ -101,6 +150,9 @@ export class Syncer extends EventEmitter<SyncerEvents> {
 
   /** Re-check every known and present file. */
   rescan(): void {
+    if (this.branchChange) {
+      return;
+    }
     const { canonicals, pathErrors } = this.engine.listCandidates();
     for (const e of pathErrors) {
       this.reportPathError(e.side, e.path, e.problem);
@@ -173,12 +225,15 @@ export class Syncer extends EventEmitter<SyncerEvents> {
   }
 
   private markDirty(canonical: string): void {
+    if (this.branchChange) {
+      return; // after a foreign checkout every change is suspect
+    }
     this.dirty.add(canonical);
     this.schedule();
   }
 
   private schedule(delay = this.engine.config.sync.debounceMs): void {
-    if (this.stopped || this.paused || this.timer) {
+    if (this.stopped || this.paused || this.branchChange || this.timer) {
       this.emitState();
       return;
     }
@@ -195,8 +250,15 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     }
     this.running = true;
     this.emitState();
+    let gitWait = false;
     try {
       while (this.dirty.size > 0 && !this.paused && !this.stopped) {
+        // Checked per file: a checkout may start in the middle of a batch.
+        const gate = this.gitGate();
+        if (gate !== "ok") {
+          gitWait = gate === "wait";
+          break;
+        }
         const canonical = this.dirty.values().next().value as string;
         this.dirty.delete(canonical);
         this.processOne(canonical);
@@ -208,6 +270,67 @@ export class Syncer extends EventEmitter<SyncerEvents> {
       this.running = false;
       this.emitState();
     }
+    if (gitWait) {
+      this.schedule(GIT_WAIT_MS);
+    }
+  }
+
+  /**
+   * May files be applied now? "blocked" — the branch changed; "wait" — a git
+   * command holds the index (a checkout writes files before it moves HEAD).
+   */
+  private gitGate(): "ok" | "wait" | "blocked" {
+    if (!this.checkBranch()) {
+      return "blocked";
+    }
+    if (this.gitDir && gitBusy(this.gitDir)) {
+      const now = Date.now();
+      if (this.gitBusySince === 0) {
+        this.gitBusySince = now;
+      } else if (this.gitBusySince > 0 && now - this.gitBusySince > GIT_WAIT_REPORT_MS) {
+        this.gitBusySince = -1; // reported
+        this.info("git занят (.git/index.lock) — синхронизация ждёт; если git не запущен, удалите этот файл");
+      }
+      return "wait";
+    }
+    this.gitBusySince = 0;
+    return "ok";
+  }
+
+  /** Compare HEAD with the profile's branch; false once they differ. */
+  private checkBranch(): boolean {
+    const expected = this.engine.config.profile.branch;
+    if (!this.gitDir || !expected) {
+      return true;
+    }
+    const actual = readHeadBranch(this.gitDir);
+    if (actual === undefined) {
+      return !this.branchChange;
+    }
+    if (this.branchChange) {
+      if (actual !== this.branchChange.actual) {
+        this.branchChange = { expected, actual };
+        this.emit("branch", this.branchChange);
+      }
+      return false;
+    }
+    if (actual === expected) {
+      return true;
+    }
+    this.branchChange = { expected, actual };
+    this.dirty.clear();
+    this.retries.clear();
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.emitEvent(
+      "error",
+      `ветка сменилась вне anonymus: ${expected} → ${actual ?? "отделённый HEAD"} — синхронизация остановлена`
+    );
+    this.emit("branch", this.branchChange);
+    this.emitState();
+    return false;
   }
 
   private processOne(canonical: string): void {
@@ -309,6 +432,9 @@ export class Syncer extends EventEmitter<SyncerEvents> {
 
   /** Resolve a held file by the user's choice. */
   async resolve(canonical: string, how: Resolution): Promise<{ ok: boolean; message: string }> {
+    if (this.branchChange) {
+      return { ok: false, message: "ветка проекта сменилась вне anonymus — сначала выберите, что делать" };
+    }
     const status = this.engine.classify(canonical);
     try {
       if (how === "editor") {
