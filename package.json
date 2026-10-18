@@ -21,7 +21,8 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepare": "npm run build",
-    "demo": "node scripts/make-demo.mjs"
+    "demo": "node scripts/make-demo.mjs",
+    "demo:play": "node scripts/play-demo.mjs"
   },
   "dependencies": {
     "chalk": "^5.3.0",
