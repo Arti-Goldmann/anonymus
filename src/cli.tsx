@@ -143,6 +143,11 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
+/** OSC 0: set the terminal window / tab title. */
+function terminalTitle(title: string): string {
+  return `\x1b]0;${title}\x07`;
+}
+
 function fail(message: string, code = 2): never {
   console.error(message);
   process.exit(code);
@@ -354,9 +359,14 @@ async function main(): Promise<void> {
   const leaveAltScreen = () => {
     if (onAltScreen) {
       onAltScreen = false;
-      process.stdout.write("\x1b[?1049l");
+      // Back to the normal screen; an empty title lets the terminal show its own again.
+      process.stdout.write("\x1b[?1049l" + terminalTitle(""));
     }
   };
+  // Tab title: "🎭 anonymus · <project>" (Windows Terminal shows it as is; VS Code
+  // shows it with terminal.integrated.tabs.title set to "${sequence}").
+  process.title = "anonymus";
+  process.stdout.write(terminalTitle(`🎭 anonymus · ${path.basename(workspace.config.projectRoot)}`));
   process.stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
   process.on("exit", leaveAltScreen);
 
