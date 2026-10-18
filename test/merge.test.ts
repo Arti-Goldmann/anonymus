@@ -65,6 +65,11 @@ describe("merging the work of several agents", () => {
     const a = folder(ws, "agent-a");
     fs.writeFileSync(path.join(a, "MyProject", "main.c"), BODY(10, 3, "MyProject"));
     fs.writeFileSync(path.join(a, "MyProject", "new.c"), "// new from agent A in MyProject\n");
+    // A Windows-1251 + CRLF file with Cyrillic context: the patch must apply as is.
+    fs.writeFileSync(
+      path.join(a, "MyProject", "ru.c"),
+      iconv.encode("// Комментарий MyProject (агент A)\r\nint x = 1;\r\n", "win1251")
+    );
     const b = folder(ws, "agent-b");
     fs.writeFileSync(path.join(b, "MyProject", "main.c"), BODY(1, 30, "MyProject"));
     fs.rmSync(path.join(b, "docs", "old.md"));
@@ -74,7 +79,7 @@ describe("merging the work of several agents", () => {
 
     expect(dir).toBe(path.join(folder(ws, "result_merge"), ".anonymus-merge"));
     const byName = Object.fromEntries(sources.map((s) => [s.name, s]));
-    expect(byName["agent-a"]).toMatchObject({ modified: 1, added: 1, deleted: 0, leaks: [] });
+    expect(byName["agent-a"]).toMatchObject({ modified: 2, added: 1, deleted: 0, leaks: [] });
     expect(byName["agent-b"]).toMatchObject({ modified: 1, added: 0, deleted: 1, leaks: [] });
 
     const patchA = fs.readFileSync(path.join(dir, "agent-a.patch"), "utf8");
@@ -97,6 +102,9 @@ describe("merging the work of several agents", () => {
     );
     expect(fs.existsSync(path.join(work, "MyProject", "new.c"))).toBe(true);
     expect(fs.existsSync(path.join(work, "docs", "old.md"))).toBe(false);
+    // The Windows-1251 + CRLF file got the change without any conversion.
+    const ru = fs.readFileSync(path.join(work, "MyProject", "ru.c"));
+    expect(iconv.decode(ru, "win1251")).toBe("// Комментарий MyProject (агент A)\r\nint x = 1;\r\n");
   });
 
   it("never syncs the merge folder into the project", async () => {
