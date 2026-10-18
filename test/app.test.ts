@@ -67,11 +67,16 @@ describe("App: sub-sandbox workflow end to end", () => {
     const press = (keys: string) => stdin.write(keys);
     (globalThis as { __screen?: () => string }).__screen = () => out.screen;
 
-    // Empty sandbox is filled automatically, then live sync with a folded header.
+    // Empty sandbox is filled automatically; live sync starts with the mascot.
     await until(() => out.screen.includes("синхронизация активна"), "live sync");
-    expect(out.screen).not.toMatch(MASCOT_ROW);
-    expect(out.screen).toContain("default ⎇ master");
+    expect(out.screen).toMatch(MASCOT_ROW);
     expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n");
+
+    // The first file that moves folds the mascot into the one-line header.
+    bench.write("project", "BIGcorpProject/readme.txt", "notes\n");
+    await until(() => bench.read("sandbox", "MyProject/readme.txt") === "notes\n", "first transfer");
+    await until(() => !MASCOT_ROW.test(out.screen), "mascot folded");
+    expect(out.screen).toContain("default ⎇ master");
 
     // b → n → name → Enter: new branch + sub-sandbox, synced right away.
     press("b");

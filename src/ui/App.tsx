@@ -28,8 +28,11 @@ type Screen =
   | "sandboxes"
   | "stopping";
 
-/** Screens of the start-up flow: the mascot is shown here, folded away later. */
+/** Screens of the start-up flow: the mascot is always shown here. */
 const STARTUP_SCREENS: Screen[] = ["scanning", "reconcile", "applying", "switching"];
+
+/** Live-sync events that mean a file actually moved; the first one folds the mascot. */
+const TRANSFER_KINDS = new Set<SyncEvent["kind"]>(["to-sandbox", "to-project", "deleted", "merged", "resolved"]);
 
 /** Events kept in memory for the on-screen log (the journal file has all). */
 const MAX_EVENTS = 500;
@@ -69,12 +72,17 @@ export function App({
   const [status, setStatus] = useState<LiveStatus>({ paused: false, busy: false, pending: 0 });
   const [stats, setStats] = useState({ toSandbox: 0, toProject: 0, deleted: 0 });
   const [fatal, setFatal] = useState<string | null>(null);
+  // The mascot stays on the live screen until the first file moves.
+  const [folded, setFolded] = useState(false);
   const syncerRef = useRef<Syncer | null>(null);
   const journal = useMemo(() => path.join(workspace.config.projectRoot, SERVICE_DIR, "anonymus.log"), [workspace]);
 
   const pushEvent = useCallback(
     (ev: SyncEvent) => {
       setEvents((prev) => [...prev.slice(-(MAX_EVENTS - 1)), ev]);
+      if (TRANSFER_KINDS.has(ev.kind)) {
+        setFolded(true);
+      }
       if (ev.kind === "to-sandbox" || ev.kind === "to-project" || ev.kind === "deleted") {
         setStats((s) => ({
           toSandbox: s.toSandbox + (ev.kind === "to-sandbox" ? 1 : 0),
@@ -146,6 +154,7 @@ export function App({
       setHeld([]);
       setStats({ toSandbox: 0, toProject: 0, deleted: 0 });
       setProgress([0, 0]);
+      setFolded(false);
       setScreen("scanning");
       try {
         const result = await scan(eng, (done, total) => setProgress([done, total]));
@@ -294,11 +303,19 @@ export function App({
 
   // One row is left free: a frame as tall as the window would scroll it.
   const frameRows = Math.max(5, rows - 1);
-  // The mascot greets during start-up (scan / reconcile / switching) and folds
-  // into a one-line header once live sync runs, leaving the space to the log.
-  const bodyMin = screen === "reconcile" ? RECONCILE_COMPACT_ROWS : screen === "switching" ? 6 : 2;
-  const fullHeader =
-    STARTUP_SCREENS.includes(screen) && columns >= HEADER_MIN_COLUMNS && frameRows >= HEADER_ROWS + bodyMin;
+  // The mascot greets during start-up and stays on the live screen until the
+  // first file moves; then it folds into a one-line header and the log gets
+  // the space. Conflict and sub-sandbox screens always use the compact header.
+  const bodyMin =
+    screen === "reconcile"
+      ? RECONCILE_COMPACT_ROWS
+      : screen === "switching"
+        ? 6
+        : screen === "live"
+          ? LIVE_CHROME_ROWS + 3
+          : 2;
+  const showMascot = STARTUP_SCREENS.includes(screen) || (screen === "live" && !folded);
+  const fullHeader = showMascot && columns >= HEADER_MIN_COLUMNS && frameRows >= HEADER_ROWS + bodyMin;
   const bodyRows = frameRows - (fullHeader ? HEADER_ROWS : 1);
 
   return (
