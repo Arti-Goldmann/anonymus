@@ -57,12 +57,20 @@ export function LiveView({
   logPath: string;
 }) {
   const shown = events.slice(-Math.max(1, logRows));
+  const held = heldCount > 0;
+  // Priority of what the frame says: pause > files waiting for a decision > work in progress > idle.
+  const borderColor = status.paused ? theme.warn : held ? theme.error : theme.accent;
   return (
     <Box flexDirection="column" flexGrow={1}>
-      <Box borderStyle="round" borderColor={status.paused ? theme.warn : theme.accent} paddingX={1} flexShrink={0}>
-        <Box flexGrow={1}>
+      <Box borderStyle="round" borderColor={borderColor} paddingX={1} flexShrink={0}>
+        {/* The status (especially "files waiting") must stay readable; the counters give way. */}
+        <Box flexGrow={1} flexShrink={0}>
           {status.paused ? (
             <Text color={theme.warn} wrap="truncate-end">⏸ пауза — изменения копятся до нажатия p</Text>
+          ) : held ? (
+            <Text color={theme.error} wrap="truncate-end">
+              ! {heldCount} {plural(heldCount, "файл ждёт", "файла ждут", "файлов ждут")} решения — нажмите c
+            </Text>
           ) : status.busy || status.pending > 0 ? (
             <Text color={theme.accent} wrap="truncate-end">
               <Spinner type="dots" /> синхронизирую{status.pending > 0 ? ` · в очереди ${status.pending}` : ""}
@@ -71,19 +79,16 @@ export function LiveView({
             <Text color={theme.ok} wrap="truncate-end">● синхронизация активна</Text>
           )}
         </Box>
-        <Text color={theme.muted}>
-          → {stats.toSandbox} · ← {stats.toProject} · ✕ {stats.deleted}
-        </Text>
+        <Box flexShrink={1} marginLeft={2} justifyContent="flex-end">
+          <Text color={theme.muted} wrap="truncate-start">
+            в песочницу <Text color={theme.sandbox}>{stats.toSandbox}</Text> · в проект{" "}
+            <Text color={theme.project}>{stats.toProject}</Text> · удалено {stats.deleted}
+          </Text>
+        </Box>
       </Box>
 
       <Box paddingX={1} flexShrink={0}>
-        {heldCount > 0 ? (
-          <Text color={theme.error} wrap="truncate-end">
-            ! {heldCount} {plural(heldCount, "файл ждёт", "файла ждут", "файлов ждут")} решения — нажмите c
-          </Text>
-        ) : (
-          <Text color={theme.muted} wrap="truncate-middle">журнал: {logPath}</Text>
-        )}
+        <Text color={theme.muted} wrap="truncate-middle">журнал: {logPath}</Text>
       </Box>
 
       <Box flexDirection="column" paddingX={1} flexGrow={1} overflow="hidden">
