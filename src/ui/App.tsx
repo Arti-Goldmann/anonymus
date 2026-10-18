@@ -8,13 +8,14 @@ import type { FileStatus, SyncEngine } from "../core/engine.js";
 import { applyReconcile, planReconcile, summarize, type Strategy } from "../core/reconcile.js";
 import { scan, type ScanResult } from "../core/scanner.js";
 import { Syncer, type BranchChange, type SyncEvent } from "../core/syncer.js";
-import type { Workspace } from "../core/workspace.js";
+import type { BranchProblem, Workspace } from "../core/workspace.js";
 import { openFolder } from "../platform.js";
 import { ConflictView } from "./ConflictView.js";
 import { CompactHeader, Header, HEADER_MIN_COLUMNS, HEADER_ROWS } from "./Header.js";
 import { LIVE_CHROME_ROWS, LiveView, type LiveStatus } from "./LiveView.js";
 import { RECONCILE_COMPACT_ROWS, RECONCILE_FULL_ROWS, ReconcileView } from "./ReconcileView.js";
 import { SandboxesView, type ActionResult } from "./SandboxesView.js";
+import { BRANCH_VIEW_ROWS, BranchView } from "./BranchView.js";
 import { prepareMerge } from "../core/mergePrep.js";
 import { formatTime, theme } from "./theme.js";
 import { useTerminalSize } from "./useTerminalSize.js";
@@ -27,6 +28,7 @@ type Screen =
   | "live"
   | "conflicts"
   | "sandboxes"
+  | "branch"
   | "stopping";
 
 /** Screens of the start-up flow: the mascot is always shown here. */
@@ -75,6 +77,8 @@ export function App({
   const [fatal, setFatal] = useState<string | null>(null);
   // Set when the branch was switched outside anonymus: sync stays stopped until the user picks.
   const [branchChange, setBranchChange] = useState<BranchChange | null>(null);
+  // Set when a profile is about to start while the project is on another branch.
+  const [branchProblem, setBranchProblem] = useState<BranchProblem | null>(null);
   // The mascot stays on the live screen until the first file moves.
   const [folded, setFolded] = useState(false);
   const syncerRef = useRef<Syncer | null>(null);
@@ -181,6 +185,19 @@ export function App({
       setStats({ toSandbox: 0, toProject: 0, deleted: 0 });
       setProgress([0, 0]);
       setFolded(false);
+      // Never scan a sub-sandbox against another branch's files: ask first.
+      let problem: BranchProblem | null = null;
+      try {
+        problem = workspace.branchProblem();
+      } catch (e) {
+        setFatal((e as Error).message);
+        return;
+      }
+      setBranchProblem(problem);
+      if (problem) {
+        setScreen("branch");
+        return;
+      }
       setScreen("scanning");
       try {
         const result = await scan(eng, (done, total) => setProgress([done, total]));
@@ -368,17 +385,11 @@ export function App({
   const adoptTarget = branchTarget && branchTarget.name !== workspace.active.name ? branchTarget : undefined;
 
   /** After a foreign checkout: put the active sub-sandbox's branch back, then sync again. */
-  const checkoutBack = useCallback(() => {
-    const branch = workspace.active.branch;
-    try {
-      // The syncer is stopped for good and drops every event meanwhile.
-      workspace.checkoutActiveBranch();
-    } catch (e) {
-      pushEvent({ time: now(), kind: "error", message: (e as Error).message });
-      return;
-    }
-    void runSwitch(`ветка ${branch} возвращена`, () => []);
-  }, [workspace, pushEvent, runSwitch]);
+  // If git refuses, startProfile finds the branch still wrong and asks again.
+  const checkoutBack = useCallback(
+    () => void runSwitch(`git checkout ${workspace.active.branch}`, (step) => workspace.checkoutActiveBranch(step)),
+    [workspace, runSwitch]
+  );
 
   // Ctrl-C always stops cleanly (state saved), whatever screen is shown.
   useInput((input, key) => {
@@ -502,7 +513,27 @@ export function App({
             onRemove={removeSandbox}
             onPrepareMerge={prepareMergeInto}
             onCommit={commitActive}
-            onBack={() => setScreen("live")}
+            onBack={() => setScreen(branchProblem ? "branch" : "live")}
+          />
+        )}
+
+        {!fatal && screen === "branch" && branchProblem && (
+          <BranchView
+            workspace={workspace}
+            problem={branchProblem}
+            events={events}
+            logRows={bodyRows - BRANCH_VIEW_ROWS}
+            onAdopt={switchTo}
+            onCreate={() =>
+              void runSwitch(`создаю подпесочницу для ветки ${branchProblem.actual}`, (step) =>
+                workspace.adoptCurrentBranch(step)
+              )
+            }
+            onCheckout={() =>
+              void runSwitch(`git checkout ${branchProblem.expected}`, (step) => workspace.checkoutActiveBranch(step))
+            }
+            onSandboxes={() => setScreen("sandboxes")}
+            onQuit={quit}
           />
         )}
 

@@ -191,3 +191,65 @@ describe("App: branch switched outside anonymus", () => {
     expect(ws.active.name).toBe("feature");
   }, 60000);
 });
+
+describe("App: start-up on a branch the active sub-sandbox is not tied to", () => {
+  let bench: Bench;
+  let unmount: (() => void) | null = null;
+  afterEach(async () => {
+    unmount?.();
+    unmount = null;
+    await new Promise((r) => setTimeout(r, 200)); // let watchers close
+    bench?.cleanup();
+  });
+
+  function startApp(ws: Workspace) {
+    const out = new FakeStdout();
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
+    const app = render(React.createElement(App, { workspace: ws, version: "test", warnings: [] }), {
+      stdout: out as never,
+      stdin: stdin as never,
+      patchConsole: false,
+      exitOnCtrlC: false,
+    });
+    unmount = () => app.unmount();
+    (globalThis as { __screen?: () => string }).__screen = () => out.screen;
+    return { out, press: (keys: string) => stdin.write(keys) };
+  }
+
+  it("asks before scanning: x checks the branch out back, a gives the branch its own sub-sandbox", async () => {
+    bench = makeBench();
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
+    bench.gitInit();
+    const ws = new Workspace(bench.config());
+    ws.reconcileWithGit(); // default ⎇ master is saved
+    bench.git("checkout", "--quiet", "-b", "loose");
+    bench.write("project", "BIGcorpProject/main.c", "int v = 2; // BIGcorpProject\n");
+    bench.git("commit", "--quiet", "-am", "loose");
+
+    // x: back to master; only then the (empty) default sandbox is filled.
+    let { out, press } = startApp(ws);
+    await until(() => out.screen.includes("в проекте ветка loose, а подпесочница «default» привязана к master"), "branch screen");
+    expect(out.screen).toContain("a  новая подпесочница для ветки loose");
+    await new Promise((r) => setTimeout(r, 300));
+    expect(bench.exists("sandbox", "MyProject/main.c")).toBe(false); // nothing scanned or copied
+    press("x");
+    await until(() => out.screen.includes("синхронизация активна"), "live on master");
+    expect(bench.git("branch", "--show-current")).toBe("master");
+    expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n");
+    unmount!();
+    await new Promise((r) => setTimeout(r, 200));
+
+    // a: a new sub-sandbox for the branch checked out by hand.
+    bench.git("checkout", "--quiet", "loose");
+    ({ out, press } = startApp(new Workspace(bench.config())));
+    await until(() => out.screen.includes("в проекте ветка loose"), "branch screen again");
+    press("a");
+    await until(
+      () => out.screen.includes("loose ⎇ loose") && out.screen.includes("синхронизация активна"),
+      "live on the new sub-sandbox"
+    );
+    const folder = path.join(path.dirname(bench.sandbox), "loose");
+    expect(fs.readFileSync(path.join(folder, "MyProject", "main.c"), "utf8")).toBe("int v = 2; // MyProject\n");
+    expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n"); // default untouched
+  }, 60000);
+});

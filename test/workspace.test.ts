@@ -128,6 +128,31 @@ describe("Workspace: sub-sandboxes per branch", () => {
     expect(again.branchMismatch).toBe(false);
   });
 
+  it("reports a branch checked out by hand that has no sub-sandbox, and adopts it", () => {
+    const ws = setup();
+    expect(ws.branchProblem()).toBeNull();
+    bench.git("checkout", "--quiet", "-b", "BIGcorpProject-loose");
+    expect(ws.branchProblem()).toEqual({ expected: "master", actual: "BIGcorpProject-loose", target: null });
+    expect(ws.validateAdopt("BIGcorpProject-loose")).toBeNull();
+
+    ws.adoptCurrentBranch();
+    expect(ws.active.name).toBe("BIGcorpProject-loose");
+    expect(ws.active.branch).toBe("BIGcorpProject-loose");
+    // A new folder with the placeholder name; no new branch was made.
+    expect(path.basename(ws.registry.absPath(ws.active))).toBe("MyProject-loose");
+    expect(fs.existsSync(ws.registry.absPath(ws.active))).toBe(true);
+    expect(bench.git("branch", "--show-current")).toBe("BIGcorpProject-loose");
+    expect(ws.branchProblem()).toBeNull();
+    expect(ws.validateAdopt("BIGcorpProject-loose")).toMatch(/уже есть/);
+
+    // And back: the problem names the sub-sandbox of the branch checked out.
+    bench.git("checkout", "--quiet", "master");
+    expect(ws.branchProblem()).toEqual({ expected: "BIGcorpProject-loose", actual: "master", target: "default" });
+    ws.checkoutActiveBranch();
+    expect(bench.git("branch", "--show-current")).toBe("BIGcorpProject-loose");
+    expect(ws.branchProblem()).toBeNull();
+  });
+
   it("removes a sub-sandbox to the trash and keeps the branch", async () => {
     const ws = setup();
     ws.create("feature");

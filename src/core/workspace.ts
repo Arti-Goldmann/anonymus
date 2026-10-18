@@ -10,6 +10,16 @@ import { Transformer } from "./transformer.js";
 /** Progress callback for multi-step operations (shown in the UI). */
 export type StepReporter = (message: string) => void;
 
+/** The project is on another branch than the active sub-sandbox. */
+export interface BranchProblem {
+  /** Branch of the active sub-sandbox. */
+  expected: string;
+  /** Branch checked out in the project; null for a detached HEAD. */
+  actual: string | null;
+  /** Sub-sandbox of `actual`, if there is one. */
+  target: string | null;
+}
+
 export interface StartupNotice {
   kind: "info" | "warning";
   message: string;
@@ -79,8 +89,8 @@ export class Workspace {
         notices.push({
           kind: "warning",
           message:
-            `в проекте ветка ${branch}, а подпесочница «${active.name}» привязана к ${active.branch}. ` +
-            `Переключитесь (b) или создайте подпесочницу для этой ветки.`,
+            `в проекте ветка ${branch}, а подпесочница «${active.name}» привязана к ${active.branch} — ` +
+            `синхронизация не запущена, пока не выбрано, что делать`,
         });
       }
     }
@@ -91,6 +101,64 @@ export class Workspace {
   /** The sub-sandbox tied to a branch, if there is one. */
   sandboxOfBranch(branch: string | null): SandboxEntry | undefined {
     return branch === null ? undefined : this.registry.list().find((s) => s.branch === branch);
+  }
+
+  /**
+   * The project's checked-out branch is not the active sub-sandbox's one.
+   * Syncing now would copy the other branch into this sub-sandbox, so the
+   * caller must not scan until the user picks what to do. Null when fine
+   * (or when there is no git / no branch to compare).
+   */
+  branchProblem(): BranchProblem | null {
+    const expected = this.registry.active.branch;
+    if (!this.git || !expected) {
+      return null;
+    }
+    const actual = this.git.currentBranch();
+    if (actual === expected) {
+      return null;
+    }
+    const target = this.sandboxOfBranch(actual);
+    return { expected, actual, target: target?.name ?? null };
+  }
+
+  /** Why the checked-out branch cannot get its own sub-sandbox, or null if it can. */
+  validateAdopt(branch: string): string | null {
+    if (this.registry.get(branch) || this.sandboxOfBranch(branch)) {
+      return `подпесочница для ветки ${branch} уже есть`;
+    }
+    const folder = this.folderFor(branch);
+    if (isInside(folder, this.config.projectRoot)) {
+      return `папка ${folder} оказалась бы внутри проекта — проверьте sandboxes_dir`;
+    }
+    if (fs.existsSync(folder) && fs.readdirSync(folder).length > 0) {
+      return `папка ${folder} уже существует и не пуста`;
+    }
+    return null;
+  }
+
+  /**
+   * A new sub-sandbox for the branch already checked out in the project (no
+   * new branch is created) and make it active. It starts empty: the next scan
+   * fills it from the project.
+   */
+  adoptCurrentBranch(step: StepReporter = () => {}): string[] {
+    const branch = this.git?.currentBranch() ?? null;
+    if (!branch) {
+      throw new Error("в проекте не выбрана ветка (отделённый HEAD) — подпесочницу привязать не к чему");
+    }
+    const problem = this.validateAdopt(branch);
+    if (problem) {
+      throw new Error(problem);
+    }
+    const folder = this.folderFor(branch);
+    step(`создаю папку ${folder}`);
+    fs.mkdirSync(folder, { recursive: true });
+    this.registry.add({ name: branch, absPath: folder, branch });
+    this.registry.setActive(branch);
+    this.branchMismatch = false;
+    this.registry.save();
+    return [];
   }
 
   /**

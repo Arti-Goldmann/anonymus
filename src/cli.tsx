@@ -350,6 +350,17 @@ async function main(): Promise<void> {
   }
 
   if (!args.tui || !process.stdout.isTTY || !process.stdin.isTTY) {
+    // Nobody to ask: refuse before the scan could copy another branch in.
+    const problem = workspace.branchProblem();
+    if (problem) {
+      fail(
+        `в проекте ветка ${problem.actual ?? "(отделённый HEAD)"}, а подпесочница «${workspace.active.name}» ` +
+          `привязана к ${problem.expected} — синхронизация не запущена.\n` +
+          `Верните ветку (git checkout ${problem.expected}), переключите подпесочницу ` +
+          `(anonymus sandbox switch <имя>) или запустите без --no-tui, чтобы создать подпесочницу для этой ветки.`,
+        1
+      );
+    }
     await runHeadless(
       workspace.engineFor(),
       [...warnings, ...notices.map((n) => n.message)],
