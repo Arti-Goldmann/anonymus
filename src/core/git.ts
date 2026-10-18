@@ -117,14 +117,30 @@ export class Git {
     if (!this.isDirty()) {
       return false;
     }
-    this.run(["add", "--all", "--", ".", ...this.ownExcludes()]);
+    this.run(["add", "--all", ...this.ownExcludes()]);
     this.run(["commit", "--quiet", "--message", message]);
     return true;
   }
 
-  /** Pathspecs that keep anonymus' own config / service folder out of git operations. */
+  /**
+   * Pathspec arguments that keep anonymus' own config / service folder out of
+   * `stash` / `add`. Paths already in .gitignore are left out: git skips them
+   * anyway and refuses ("paths are ignored") when they are named explicitly.
+   * Returns [] when nothing needs excluding — then no pathspec is passed at all.
+   */
   private ownExcludes(): string[] {
-    return OWN_PATHS.map((p) => `:(exclude)${p.replace(/\/$/, "")}`);
+    const excludes = OWN_PATHS.map((p) => p.replace(/\/$/, "")).filter((p) => !this.isIgnored(p));
+    return excludes.length ? ["--", ".", ...excludes.map((p) => `:(exclude)${p}`)] : [];
+  }
+
+  /** Is `p` ignored by .gitignore (or info/exclude)? */
+  private isIgnored(p: string): boolean {
+    try {
+      this.run(["check-ignore", "--quiet", p]);
+      return true;
+    } catch {
+      return false; // exit code 1: not ignored
+    }
   }
 
   checkout(name: string): void {
@@ -146,7 +162,7 @@ export class Git {
    * while branches are switched.
    */
   stashPush(label: string): void {
-    this.run(["stash", "push", "--include-untracked", "--message", label, "--", ".", ...this.ownExcludes()]);
+    this.run(["stash", "push", "--include-untracked", "--message", label, ...this.ownExcludes()]);
   }
 
   /** `stash@{n}` of the newest stash whose message contains `label`, if any. */
@@ -163,5 +179,9 @@ export class Git {
 
   stashPop(ref: string): void {
     this.run(["stash", "pop", "--quiet", ref]);
+  }
+
+  stashDrop(ref: string): void {
+    this.run(["stash", "drop", "--quiet", ref]);
   }
 }

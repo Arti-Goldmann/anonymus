@@ -138,7 +138,18 @@ export class Workspace {
       if (this.git.isDirty()) {
         const label = `anonymus:${current.name}:${Date.now()}`;
         step(`незакоммиченные изменения ветки ${current.branch ?? "?"} → git stash`);
-        this.git.stashPush(label);
+        try {
+          this.git.stashPush(label);
+        } catch (e) {
+          // git may have saved the stash and then failed before cleaning the
+          // working tree: the changes are still in place, so that stash is a
+          // redundant copy — remove it rather than leave it orphaned.
+          const ref = this.git.findStash(label);
+          if (ref && this.git.isDirty()) {
+            this.git.stashDrop(ref);
+          }
+          throw e;
+        }
         current.stash = label;
         this.registry.save();
       }

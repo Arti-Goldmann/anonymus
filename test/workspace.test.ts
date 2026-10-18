@@ -86,6 +86,37 @@ describe("Workspace: sub-sandboxes per branch", () => {
     expect(ws.registry.get("feature")!.stash).toBeNull();
   });
 
+  it("switches when anonymus' own files are in .gitignore (as `anonymus init` sets it up)", async () => {
+    bench = makeBench();
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1;\n");
+    bench.write("project", ".gitignore", "anonymus.yaml\n.anonymus/\n");
+    bench.write("project", "anonymus.yaml", "# real names\n");
+    bench.gitInit();
+    const ws = new Workspace(bench.config());
+    ws.reconcileWithGit();
+    ws.create("feature");
+    bench.write("project", "BIGcorpProject/main.c", "int v = 2;\n");
+    bench.write("project", "BIGcorpProject/new.c", "// new\n");
+
+    ws.switchTo("default");
+    expect(bench.git("branch", "--show-current")).toBe("master");
+    expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 1;\n");
+    expect(bench.exists("project", "anonymus.yaml")).toBe(true);
+    expect(bench.git("stash", "list").split("\n").filter(Boolean)).toHaveLength(1);
+
+    ws.switchTo("feature");
+    expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 2;\n");
+    expect(bench.read("project", "BIGcorpProject/new.c")).toBe("// new\n");
+    expect(bench.git("stash", "list")).toBe("");
+
+    // Committing also works with ignored own files.
+    expect(ws.commitActive("feature work")).toBe(true);
+    expect(bench.git("show", "--name-only", "--format=", "HEAD").split("\n").sort()).toEqual([
+      "BIGcorpProject/main.c",
+      "BIGcorpProject/new.c",
+    ]);
+  });
+
   it("picks the sub-sandbox of a branch that was checked out by hand", () => {
     const ws = setup();
     ws.create("feature");
