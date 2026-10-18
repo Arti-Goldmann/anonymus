@@ -6,8 +6,9 @@ import { render } from "ink";
 import { ConfigError, findConfig, loadConfig } from "./config/loader.js";
 import { SERVICE_DIR } from "./config/schema.js";
 import { CONFIG_TEMPLATE } from "./config/template.js";
-import { SyncEngine } from "./core/engine.js";
+import type { SyncEngine } from "./core/engine.js";
 import { acquireLock } from "./core/lock.js";
+import { Workspace } from "./core/workspace.js";
 import { applyReconcile, planReconcile, type Strategy } from "./core/reconcile.js";
 import { KIND_LABEL, scan } from "./core/scanner.js";
 import { Syncer } from "./core/syncer.js";
@@ -23,6 +24,12 @@ const HELP = `anonymus — автоматическая синхронизаци
   anonymus init         создать anonymus.yaml из шаблона
   anonymus scan         только показать расхождения (код 1, если они есть)
 
+Подпесочницы (по одной на git-ветку проекта):
+  anonymus sandboxes                  список
+  anonymus sandbox new <имя>          новая ветка от текущей + подпесочница
+  anonymus sandbox switch <имя>       переключить проект на ветку подпесочницы
+  anonymus sandbox remove <имя>       удалить подпесочницу (папка в корзину)
+
 Опции:
   -c, --config <файл>   путь к конфигу (по умолчанию ./anonymus.yaml)
   --no-tui              простой построчный вывод вместо интерфейса
@@ -31,8 +38,12 @@ const HELP = `anonymus — автоматическая синхронизаци
   -h, --help            эта справка
 `;
 
+type SandboxAction = "new" | "switch" | "remove";
+
 interface Args {
-  command: "start" | "init" | "scan";
+  command: "start" | "init" | "scan" | "sandboxes" | "sandbox";
+  sandboxAction?: SandboxAction;
+  sandboxName?: string;
   config?: string;
   tui: boolean;
   strategy?: Strategy;
@@ -58,8 +69,20 @@ function parseArgs(argv: string[]): Args {
   const args: Args = { command: "start", tui: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "init" || a === "scan") {
+    if (a === "init" || a === "scan" || a === "sandboxes") {
       args.command = a;
+    } else if (a === "sandbox") {
+      const action = argv[++i];
+      const name = argv[++i];
+      if (action !== "new" && action !== "switch" && action !== "remove") {
+        fail("sandbox: укажите new | switch | remove и имя");
+      }
+      if (!name) {
+        fail(`sandbox ${action}: укажите имя подпесочницы`);
+      }
+      args.command = "sandbox";
+      args.sandboxAction = action;
+      args.sandboxName = name;
     } else if (a === "-c" || a === "--config") {
       args.config = argv[++i];
     } else if (a === "--no-tui") {
@@ -109,10 +132,10 @@ function runInit(cwd: string): void {
   console.log("Отредактируйте sandbox, sync.include и replacements, затем запустите `anonymus`.");
 }
 
-function load(cwd: string, explicit?: string): { engine: SyncEngine; warnings: string[] } {
+function load(cwd: string, explicit?: string): { workspace: Workspace; warnings: string[] } {
   try {
     const { config, warnings } = loadConfig(findConfig(cwd, explicit));
-    return { engine: new SyncEngine(config), warnings };
+    return { workspace: new Workspace(config), warnings };
   } catch (e) {
     if (e instanceof ConfigError) {
       fail(`Ошибка в конфиге:\n  - ${e.problems.join("\n  - ")}`);
@@ -135,6 +158,41 @@ async function runScan(engine: SyncEngine): Promise<void> {
     console.log(`  ошибка пути (${e.side === "project" ? "проект" : "песочница"}) ${e.path}: ${e.problem}`);
   }
   process.exit(result.clean ? 0 : 1);
+}
+
+function printSandboxes(workspace: Workspace): void {
+  if (!workspace.gitEnabled) {
+    console.log("(проект не git-репозиторий — доступна только подпесочница default)");
+  }
+  for (const s of workspace.registry.list()) {
+    const mark = s.name === workspace.active.name ? "●" : "○";
+    const extra = [s.stash ? "есть stash" : "", fs.existsSync(workspace.registry.absPath(s)) ? "" : "папка не найдена"]
+      .filter(Boolean)
+      .join(", ");
+    console.log(`${mark} ${s.name.padEnd(24)} ⎇ ${(s.branch ?? "—").padEnd(24)} ${workspace.registry.absPath(s)}${extra ? `  (${extra})` : ""}`);
+  }
+}
+
+function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: string): void {
+  const step = (m: string) => console.log(`  … ${m}`);
+  try {
+    let warnings: string[] = [];
+    if (action === "new") {
+      warnings = workspace.create(name, step).warnings;
+    } else if (action === "switch") {
+      warnings = workspace.switchTo(name, step);
+    } else {
+      warnings = workspace.remove(name, step).warnings;
+    }
+    warnings.forEach((w) => console.log(`⚠ ${w}`));
+    console.log("готово.");
+    printSandboxes(workspace);
+    if (action !== "remove") {
+      console.log("Запустите anonymus, чтобы синхронизировать активную подпесочницу.");
+    }
+  } catch (e) {
+    fail(`Ошибка: ${(e as Error).message}`, 1);
+  }
 }
 
 /** Line-by-line mode for non-interactive terminals, logs and CI. */
@@ -176,14 +234,22 @@ async function main(): Promise<void> {
     runInit(cwd);
     return;
   }
-  const { engine, warnings } = load(cwd, args.config);
+  const { workspace, warnings } = load(cwd, args.config);
+  const notices = workspace.reconcileWithGit();
 
   if (args.command === "scan") {
-    await runScan(engine);
+    notices.forEach((n) => console.log(`${n.kind === "warning" ? "⚠" : "·"} ${n.message}`));
+    await runScan(workspace.engineFor());
+    return;
+  }
+  if (args.command === "sandboxes") {
+    printSandboxes(workspace);
     return;
   }
 
-  const lock = acquireLock(engine.state.dir);
+  // One running anonymus per project, whatever sub-sandbox is active: two
+  // instances would fight over the checked-out branch.
+  const lock = acquireLock(path.join(workspace.config.projectRoot, SERVICE_DIR));
   if ("heldBy" in lock) {
     fail(
       `anonymus уже запущен для этого проекта (процесс ${lock.heldBy}).\n` +
@@ -193,8 +259,17 @@ async function main(): Promise<void> {
   }
   process.on("exit", lock.release);
 
+  if (args.command === "sandbox") {
+    runSandboxCommand(workspace, args.sandboxAction!, args.sandboxName!);
+    return;
+  }
+
   if (!args.tui || !process.stdout.isTTY || !process.stdin.isTTY) {
-    await runHeadless(engine, warnings, args.strategy);
+    await runHeadless(
+      workspace.engineFor(),
+      [...warnings, ...notices.map((n) => n.message)],
+      args.strategy
+    );
     return;
   }
   // Full-screen UI on the alternate screen: resizing redraws one frame instead
@@ -210,14 +285,14 @@ async function main(): Promise<void> {
   process.stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
   process.on("exit", leaveAltScreen);
 
-  const app = render(<App engine={engine} version={version()} warnings={warnings} />, {
+  const app = render(<App workspace={workspace} version={version()} warnings={warnings} />, {
     stdout: flickerFreeStdout(process.stdout),
     exitOnCtrlC: false,
     patchConsole: false,
   });
   await app.waitUntilExit();
   leaveAltScreen();
-  console.log(`anonymus остановлен. Журнал: ${path.join(engine.projectRoot, SERVICE_DIR, "anonymus.log")}`);
+  console.log(`anonymus остановлен. Журнал: ${path.join(workspace.config.projectRoot, SERVICE_DIR, "anonymus.log")}`);
   process.exit(0);
 }
 

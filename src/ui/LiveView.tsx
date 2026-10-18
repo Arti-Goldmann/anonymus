@@ -101,7 +101,7 @@ export function LiveView({
 
       <Box paddingX={1} flexShrink={0}>
         <Text color={theme.muted} wrap="truncate-end">
-          c конфликты · p {status.paused ? "продолжить" : "пауза"} · r пересканировать · o корзина · q выход
+          c конфликты · b ветки · p {status.paused ? "продолжить" : "пауза"} · r пересканировать · o корзина · q выход
         </Text>
       </Box>
     </Box>

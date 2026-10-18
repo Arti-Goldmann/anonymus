@@ -34,7 +34,8 @@ export function Header({ config, version }: { config: AnonymusConfig; version: s
           <PathLine label="проект    " color={theme.project} value={config.projectRoot} />
           <PathLine label="песочница " color={theme.sandbox} value={config.profile.sandboxRoot} />
           <Text color={theme.muted} wrap="truncate-end">
-            профиль {config.profile.name} · замен {config.replacements.length}
+            подпесочница {config.profile.name}
+            {config.profile.branch ? ` ⎇ ${config.profile.branch}` : ""} · замен {config.replacements.length}
           </Text>
         </Box>
       </Box>
@@ -51,6 +52,9 @@ export function CompactHeader({ config, version }: { config: AnonymusConfig; ver
           ▀▄ anonymus
         </Text>
         <Text color={theme.muted}> v{version} · </Text>
+        <Text bold>{config.profile.name}</Text>
+        {config.profile.branch && <Text color={theme.muted}> ⎇ {config.profile.branch}</Text>}
+        <Text color={theme.muted}> · </Text>
         <Text color={theme.project}>{path.basename(config.projectRoot)}</Text>
         <Text color={theme.muted}> ⇄ </Text>
         <Text color={theme.sandbox}>{path.basename(config.profile.sandboxRoot)}</Text>

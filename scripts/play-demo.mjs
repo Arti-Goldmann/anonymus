@@ -53,7 +53,7 @@ function edit(file, change, eol) {
 }
 
 function requireRunning() {
-  const lock = path.join(P, ".anonymus", "profiles", "default", "lock");
+  const lock = path.join(P, ".anonymus", "lock");
   const sandboxReady = fs.existsSync(path.join(S, "MyProject_cpu01", "main.c"));
   let running = false;
   try {

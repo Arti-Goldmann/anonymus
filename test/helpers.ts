@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,6 +18,10 @@ export interface Bench {
   exists(side: "project" | "sandbox", rel: string): boolean;
   remove(side: "project" | "sandbox", rel: string): void;
   engine(overrides?: Partial<SyncRules>, replacements?: ReplacementRule[]): SyncEngine;
+  config(overrides?: Partial<SyncRules>, replacements?: ReplacementRule[]): AnonymusConfig;
+  /** Make the project a git repo with one commit of everything in it. */
+  gitInit(): void;
+  git(...args: string[]): string;
   cleanup(): void;
 }
 
@@ -58,10 +63,14 @@ export function makeBench(): Bench {
       fs.rmSync(abs(side, rel), { force: true });
     },
     engine(overrides = {}, replacements = REPLACEMENTS) {
-      const config: AnonymusConfig = {
+      return new SyncEngine(this.config(overrides, replacements));
+    },
+    config(overrides = {}, replacements = REPLACEMENTS) {
+      return {
         projectRoot: project,
         configPath: path.join(project, "anonymus.yaml"),
         profile: { name: "default", sandboxRoot: sandbox },
+        sandboxesDir: root,
         sync: {
           include: ["**"],
           exclude: [],
@@ -74,7 +83,17 @@ export function makeBench(): Bench {
         },
         replacements,
       };
-      return new SyncEngine(config);
+    },
+    git(...args: string[]) {
+      return execFileSync("git", args, { cwd: project, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    },
+    gitInit() {
+      this.git("init", "--quiet", "--initial-branch=master");
+      this.git("config", "user.name", "test");
+      this.git("config", "user.email", "test@example.com");
+      this.git("config", "core.autocrlf", "false");
+      this.git("add", "-A");
+      this.git("commit", "--quiet", "-m", "initial");
     },
     cleanup() {
       fs.rmSync(root, { recursive: true, force: true });

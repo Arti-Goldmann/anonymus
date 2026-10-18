@@ -40,15 +40,15 @@ export interface SyncRules {
 }
 
 /**
- * One sandbox paired with the project. Only `default` exists today; the
- * branch-per-sandbox feature will add more profiles (each with its own git
- * branch of the main project) and a way to switch between them.
+ * One sandbox paired with the project. Each profile ("sub-sandbox") belongs to
+ * one git branch of the project; only the active profile is synced, switching
+ * checks its branch out (see core/workspace.ts).
  */
 export interface Profile {
   name: string;
   /** Absolute path of the sandbox root. */
   sandboxRoot: string;
-  /** Git branch of the main project this sandbox belongs to (future). */
+  /** Git branch of the main project this sandbox belongs to. */
   branch?: string;
 }
 
@@ -58,6 +58,8 @@ export interface AnonymusConfig {
   /** Absolute path of the config file itself. */
   configPath: string;
   profile: Profile;
+  /** Folder new sub-sandboxes are created in. */
+  sandboxesDir: string;
   sync: SyncRules;
   replacements: ReplacementRule[];
 }

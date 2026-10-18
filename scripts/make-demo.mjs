@@ -8,6 +8,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import iconv from "iconv-lite";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "demo");
@@ -21,14 +22,29 @@ const sandbox = path.join(root, "sandbox");
 function clearDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
   for (const name of fs.readdirSync(dir)) {
-    fs.rmSync(path.join(dir, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    forceRm(path.join(dir, name));
+  }
+}
+
+/** rm -rf that also copes with read-only files (git objects on Windows). */
+function forceRm(p) {
+  try {
+    fs.rmSync(p, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (e) {
+    if (e.code !== "EPERM" && e.code !== "EACCES") throw e;
+    const makeWritable = (q) => {
+      fs.chmodSync(q, 0o666);
+      if (fs.statSync(q).isDirectory()) for (const n of fs.readdirSync(q)) makeWritable(path.join(q, n));
+    };
+    makeWritable(p);
+    fs.rmSync(p, { recursive: true, force: true });
   }
 }
 
 fs.mkdirSync(root, { recursive: true });
 for (const name of fs.readdirSync(root)) {
   if (name !== "proj" && name !== "sandbox") {
-    fs.rmSync(path.join(root, name), { recursive: true, force: true });
+    forceRm(path.join(root, name)); // includes sub-sandboxes created during a demo
   }
 }
 clearDir(proj);
@@ -159,6 +175,17 @@ replacements:
     variants: exact
 `
 );
+
+// The project is a git repo so sub-sandboxes per branch can be tried out.
+// Real-names config and anonymus' service folder stay out of git.
+write(".gitignore", "anonymus.yaml\n.anonymus/\n.venv*/\n/build/\nsecrets/\n");
+const git = (...args) => execFileSync("git", args, { cwd: proj, stdio: ["ignore", "pipe", "pipe"] });
+git("init", "--quiet", "--initial-branch=master");
+git("config", "user.name", "demo");
+git("config", "user.email", "demo@example.com");
+git("config", "core.autocrlf", "false"); // keep CRLF / LF exactly as written on checkout
+git("add", "-A");
+git("commit", "--quiet", "-m", "Прошивка BIGcorpProject 1.4.2");
 
 fs.writeFileSync(
   path.join(root, "demo.code-workspace"),

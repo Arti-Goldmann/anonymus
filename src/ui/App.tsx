@@ -5,50 +5,72 @@ import { Box, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
 import { SERVICE_DIR } from "../config/schema.js";
 import type { FileStatus, SyncEngine } from "../core/engine.js";
-import { applyReconcile, planReconcile, type Strategy } from "../core/reconcile.js";
+import { applyReconcile, planReconcile, summarize, type Strategy } from "../core/reconcile.js";
 import { scan, type ScanResult } from "../core/scanner.js";
 import { Syncer, type SyncEvent } from "../core/syncer.js";
+import type { Workspace } from "../core/workspace.js";
 import { openFolder } from "../platform.js";
 import { ConflictView } from "./ConflictView.js";
 import { CompactHeader, Header, HEADER_MIN_COLUMNS, HEADER_ROWS } from "./Header.js";
 import { LIVE_CHROME_ROWS, LiveView, type LiveStatus } from "./LiveView.js";
 import { RECONCILE_COMPACT_ROWS, RECONCILE_FULL_ROWS, ReconcileView } from "./ReconcileView.js";
+import { SandboxesView } from "./SandboxesView.js";
 import { formatTime, theme } from "./theme.js";
 import { useTerminalSize } from "./useTerminalSize.js";
 
-type Screen = "scanning" | "reconcile" | "applying" | "live" | "conflicts" | "stopping";
+type Screen =
+  | "scanning"
+  | "reconcile"
+  | "applying"
+  | "switching"
+  | "live"
+  | "conflicts"
+  | "sandboxes"
+  | "stopping";
+
+/** Screens of the start-up flow: the mascot is shown here, folded away later. */
+const STARTUP_SCREENS: Screen[] = ["scanning", "reconcile", "applying", "switching"];
 
 /** Events kept in memory for the on-screen log (the journal file has all). */
 const MAX_EVENTS = 500;
+
+const now = () => new Date();
 
 /**
  * Root component. The whole UI is one frame exactly as tall as the window
  * (drawn on the terminal's alternate screen, see cli.tsx), so resizing just
  * redraws the frame — nothing is left behind in the scrollback.
+ *
+ * The workspace holds all sub-sandboxes; `engine` is the active one. A profile
+ * goes through: scan → (reconcile screen | automatic reconcile) → live sync.
+ * Switching stops the syncer, switches the git branch and starts over.
  */
 export function App({
-  engine,
+  workspace,
   version,
   warnings,
 }: {
-  engine: SyncEngine;
+  workspace: Workspace;
   version: string;
   warnings: string[];
 }) {
   const { exit } = useApp();
   const { columns, rows } = useTerminalSize();
+  const [engine, setEngine] = useState<SyncEngine>(() => workspace.engineFor());
+  const engineRef = useRef(engine);
   const [screen, setScreen] = useState<Screen>("scanning");
   const [progress, setProgress] = useState<[number, number]>([0, 0]);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [steps, setSteps] = useState<string[]>([]);
   const [events, setEvents] = useState<SyncEvent[]>(() =>
-    warnings.map((w) => ({ time: new Date(), kind: "warning" as const, message: w }))
+    warnings.map((w) => ({ time: now(), kind: "warning" as const, message: w }))
   );
   const [held, setHeld] = useState<FileStatus[]>([]);
   const [status, setStatus] = useState<LiveStatus>({ paused: false, busy: false, pending: 0 });
   const [stats, setStats] = useState({ toSandbox: 0, toProject: 0, deleted: 0 });
   const [fatal, setFatal] = useState<string | null>(null);
   const syncerRef = useRef<Syncer | null>(null);
-  const journal = useMemo(() => path.join(engine.projectRoot, SERVICE_DIR, "anonymus.log"), [engine]);
+  const journal = useMemo(() => path.join(workspace.config.projectRoot, SERVICE_DIR, "anonymus.log"), [workspace]);
 
   const pushEvent = useCallback(
     (ev: SyncEvent) => {
@@ -63,17 +85,24 @@ export function App({
       try {
         fs.mkdirSync(path.dirname(journal), { recursive: true });
         const date = ev.time.toISOString().slice(0, 10);
-        fs.appendFileSync(journal, `${date} ${formatTime(ev.time)}  ${ev.kind.padEnd(10)} ${ev.message}\n`, "utf8");
+        const profile = engineRef.current.config.profile.name;
+        fs.appendFileSync(
+          journal,
+          `${date} ${formatTime(ev.time)}  [${profile}] ${ev.kind.padEnd(10)} ${ev.message}\n`,
+          "utf8"
+        );
       } catch {
         // The journal is a convenience; never break syncing over it.
       }
     },
     [journal]
   );
+  const info = useCallback((message: string) => pushEvent({ time: now(), kind: "info", message }), [pushEvent]);
+  const warn = useCallback((message: string) => pushEvent({ time: now(), kind: "warning", message }), [pushEvent]);
 
   const startLive = useCallback(
-    async (initiallyHeld: FileStatus[]) => {
-      const syncer = new Syncer(engine, initiallyHeld);
+    async (eng: SyncEngine, initiallyHeld: FileStatus[]) => {
+      const syncer = new Syncer(eng, initiallyHeld);
       syncerRef.current = syncer;
       syncer.on("event", pushEvent);
       syncer.on("held", setHeld);
@@ -82,75 +111,158 @@ export function App({
       setScreen("live");
       await syncer.start();
     },
-    [engine, pushEvent]
+    [pushEvent]
   );
 
-  // Startup scan.
-  useEffect(() => {
-    let cancelled = false;
-    scan(engine, (done, total) => !cancelled && setProgress([done, total]))
-      .then((result) => {
-        if (cancelled) return;
-        setScanResult(result);
-        if (result.clean) {
-          // Remember files that already match, so later changes are one-sided.
-          for (const s of result.statuses) engine.record(s.canonical);
-          engine.flush();
-          pushEvent({
-            time: new Date(),
-            kind: "info",
-            message: `проект и песочница совпадают (${result.statuses.length} файлов)`,
-          });
-          void startLive([]);
-        } else {
-          setScreen("reconcile");
+  const reportOutcome = useCallback(
+    (eng: SyncEngine, outcome: Awaited<ReturnType<typeof applyReconcile>>, label: string) => {
+      info(
+        `${label}: в песочницу ${outcome.transfers.filter((t) => t.to === "sandbox").length}, ` +
+          `в проект ${outcome.transfers.filter((t) => t.to === "project").length}, ` +
+          `удалено ${outcome.deleted}, слито ${outcome.merged}, на решение ${outcome.held.length}`
+      );
+      for (const t of outcome.transfers) {
+        if (t.leaks.length > 0) {
+          warn(`возможная утечка в ${eng.mapper.toSandbox(t.canonical)}: ${t.leaks.join(", ")}`);
         }
-      })
-      .catch((e) => setFatal((e as Error).message));
-    return () => {
-      cancelled = true;
-    };
-  }, [engine, pushEvent, startLive]);
+      }
+      for (const f of outcome.failures) {
+        pushEvent({ time: now(), kind: "error", message: `${f.status.canonical}: ${f.error}` });
+      }
+    },
+    [info, warn, pushEvent]
+  );
+
+  /**
+   * Bring one sub-sandbox up: scan, then reconcile — automatically when it is
+   * unambiguous (an empty sandbox to fill, or only one-sided changes since the
+   * last sync), otherwise on the reconcile screen — and start live sync.
+   */
+  const startProfile = useCallback(
+    async (eng: SyncEngine) => {
+      engineRef.current = eng;
+      setEngine(eng);
+      setScanResult(null);
+      setHeld([]);
+      setStats({ toSandbox: 0, toProject: 0, deleted: 0 });
+      setProgress([0, 0]);
+      setScreen("scanning");
+      try {
+        const result = await scan(eng, (done, total) => setProgress([done, total]));
+        if (result.clean) {
+          for (const s of result.statuses) eng.record(s.canonical);
+          eng.flush();
+          info(`«${eng.config.profile.name}»: проект и песочница совпадают (${result.statuses.length} файлов)`);
+          return startLive(eng, []);
+        }
+
+        const fillEmpty = result.sandboxFiles === 0 && result.projectFiles > 0 && result.pathErrors.length === 0;
+        const smart = summarize(planReconcile(result, "smart"));
+        const oneSided =
+          eng.state.size > 0 &&
+          !workspace.branchMismatch &&
+          smart.user === 0 &&
+          smart.deleteProject === 0 &&
+          smart.deleteSandbox === 0;
+        if (fillEmpty || oneSided) {
+          const strategy: Strategy = fillEmpty ? "project-wins" : "smart";
+          setScreen("applying");
+          const outcome = await applyReconcile(eng, planReconcile(result, strategy), (d, t) => setProgress([d, t]));
+          reportOutcome(eng, outcome, fillEmpty ? "песочница заполнена" : "автосверка");
+          return startLive(eng, outcome.held);
+        }
+        setScanResult(result);
+        setScreen("reconcile");
+      } catch (e) {
+        setFatal((e as Error).message);
+      }
+    },
+    [workspace, info, reportOutcome, startLive]
+  );
+
+  // Start-up: align the active sub-sandbox with the checked-out branch, then go.
+  useEffect(() => {
+    for (const n of workspace.reconcileWithGit()) {
+      pushEvent({ time: now(), kind: n.kind, message: n.message });
+    }
+    void startProfile(workspace.engineFor());
+    // Run once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const apply = useCallback(
     (strategy: Strategy) => {
+      const eng = engineRef.current;
       if (!scanResult) return;
       setScreen("applying");
       setProgress([0, 0]);
-      applyReconcile(engine, planReconcile(scanResult, strategy), (d, t) => setProgress([d, t]))
+      applyReconcile(eng, planReconcile(scanResult, strategy), (d, t) => setProgress([d, t]))
         .then((outcome) => {
-          pushEvent({
-            time: new Date(),
-            kind: "info",
-            message:
-              `сверка: в песочницу ${outcome.transfers.filter((t) => t.to === "sandbox").length}, ` +
-              `в проект ${outcome.transfers.filter((t) => t.to === "project").length}, ` +
-              `удалено ${outcome.deleted}, слито ${outcome.merged}, на решение ${outcome.held.length}`,
-          });
-          for (const t of outcome.transfers) {
-            if (t.leaks.length > 0) {
-              pushEvent({
-                time: new Date(),
-                kind: "warning",
-                message: `возможная утечка в ${engine.mapper.toSandbox(t.canonical)}: ${t.leaks.join(", ")}`,
-              });
-            }
-          }
-          for (const f of outcome.failures) {
-            pushEvent({ time: new Date(), kind: "error", message: `${f.status.canonical}: ${f.error}` });
-          }
-          return startLive(outcome.held);
+          reportOutcome(eng, outcome, "сверка");
+          return startLive(eng, outcome.held);
         })
         .catch((e) => setFatal((e as Error).message));
     },
-    [engine, scanResult, pushEvent, startLive]
+    [scanResult, reportOutcome, startLive]
+  );
+
+  const stopSyncer = useCallback(async () => {
+    const s = syncerRef.current;
+    syncerRef.current = null;
+    if (s) {
+      s.removeAllListeners();
+      await s.stop();
+    }
+  }, []);
+
+  /** Stop syncing, run a branch operation, then bring the new active profile up. */
+  const runSwitch = useCallback(
+    async (title: string, operation: (step: (m: string) => void) => string[]) => {
+      setScreen("switching");
+      setSteps([title]);
+      await stopSyncer();
+      // Let the screen show before git (synchronous) runs.
+      await new Promise((r) => setTimeout(r, 30));
+      try {
+        const opWarnings = operation((m) => setSteps((s) => [...s, m]));
+        opWarnings.forEach(warn);
+        const active = workspace.active;
+        info(`активна «${active.name}»${active.branch ? ` ⎇ ${active.branch}` : ""}`);
+      } catch (e) {
+        pushEvent({ time: now(), kind: "error", message: (e as Error).message });
+      }
+      await startProfile(workspace.engineFor());
+    },
+    [stopSyncer, workspace, warn, info, pushEvent, startProfile]
+  );
+
+  const switchTo = useCallback(
+    (name: string) => void runSwitch(`переключаюсь на «${name}»`, (step) => workspace.switchTo(name, step)),
+    [runSwitch, workspace]
+  );
+  const createSandbox = useCallback(
+    (name: string) =>
+      void runSwitch(`создаю подпесочницу «${name}»`, (step) => workspace.create(name, step).warnings),
+    [runSwitch, workspace]
+  );
+  const removeSandbox = useCallback(
+    (name: string) => {
+      try {
+        const { trashDir, warnings: w } = workspace.remove(name);
+        w.forEach(warn);
+        info(`подпесочница «${name}» удалена (папка в ${path.relative(workspace.config.projectRoot, trashDir)}), ветка оставлена`);
+        return { ok: true, message: `«${name}» удалена, папка в корзине` };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message };
+      }
+    },
+    [workspace, warn, info]
   );
 
   const quit = useCallback(() => {
     setScreen("stopping");
-    const s = syncerRef.current;
-    (s ? s.stop() : Promise.resolve()).finally(() => exit());
-  }, [exit]);
+    void stopSyncer().finally(() => exit());
+  }, [exit, stopSyncer]);
 
   // Ctrl-C always stops cleanly (state saved), whatever screen is shown.
   useInput((input, key) => {
@@ -166,10 +278,12 @@ export function App({
         quit();
       } else if ((input === "c" || input === "с") && s) {
         setScreen("conflicts");
+      } else if (input === "b" || input === "и") {
+        setScreen("sandboxes");
       } else if ((input === "p" || input === "з") && s) {
         s.isPaused() ? s.resume() : s.pause();
       } else if ((input === "r" || input === "к") && s) {
-        pushEvent({ time: new Date(), kind: "info", message: "пересканирую обе стороны…" });
+        info("пересканирую обе стороны…");
         s.rescan();
       } else if (input === "o" || input === "щ") {
         openFolder(engine.trash.root);
@@ -180,15 +294,11 @@ export function App({
 
   // One row is left free: a frame as tall as the window would scroll it.
   const frameRows = Math.max(5, rows - 1);
-  // The mascot is shown whenever the screen below it still fits (the menu
-  // switches to its compact form); while syncing, log space wins.
-  const bodyMin =
-    screen === "live" || screen === "conflicts"
-      ? LIVE_CHROME_ROWS + 8
-      : screen === "reconcile"
-        ? RECONCILE_COMPACT_ROWS
-        : 2;
-  const fullHeader = columns >= HEADER_MIN_COLUMNS && frameRows >= HEADER_ROWS + bodyMin;
+  // The mascot greets during start-up (scan / reconcile / switching) and folds
+  // into a one-line header once live sync runs, leaving the space to the log.
+  const bodyMin = screen === "reconcile" ? RECONCILE_COMPACT_ROWS : screen === "switching" ? 6 : 2;
+  const fullHeader =
+    STARTUP_SCREENS.includes(screen) && columns >= HEADER_MIN_COLUMNS && frameRows >= HEADER_ROWS + bodyMin;
   const bodyRows = frameRows - (fullHeader ? HEADER_ROWS : 1);
 
   return (
@@ -207,6 +317,16 @@ export function App({
             <Spinner type="dots" /> {screen === "scanning" ? "сравниваю проект и песочницу" : "применяю сверку"}
             <Text color={theme.muted}>{progress[1] > 0 ? `  ${progress[0]}/${progress[1]}` : ""}</Text>
           </Text>
+        )}
+
+        {!fatal && screen === "switching" && (
+          <Box flexDirection="column">
+            {steps.map((s, i) => (
+              <Text key={i} color={i === steps.length - 1 ? theme.accent : theme.muted} wrap="truncate-end">
+                {i === steps.length - 1 ? <Spinner type="dots" /> : "✓"} {s}
+              </Text>
+            ))}
+          </Box>
         )}
 
         {!fatal && screen === "reconcile" && scanResult && (
@@ -235,6 +355,18 @@ export function App({
             held={held}
             maxItems={Math.max(3, bodyRows - 12)}
             onResolve={(c, how) => syncerRef.current!.resolve(c, how)}
+            onBack={() => setScreen("live")}
+          />
+        )}
+
+        {!fatal && screen === "sandboxes" && (
+          <SandboxesView
+            workspace={workspace}
+            heldCount={held.length}
+            maxItems={Math.max(3, bodyRows - 12)}
+            onSwitch={switchTo}
+            onCreate={createSandbox}
+            onRemove={removeSandbox}
             onBack={() => setScreen("live")}
           />
         )}

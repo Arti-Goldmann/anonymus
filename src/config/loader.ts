@@ -171,7 +171,7 @@ function parseReplacements(raw: any, problems: string[], warnings: string[]): Re
 }
 
 /** True if `child` is `parent` itself or lies somewhere inside it. */
-function isInside(child: string, parent: string): boolean {
+export function isInside(child: string, parent: string): boolean {
   const rel = path.relative(parent, child);
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
@@ -211,6 +211,19 @@ export function loadConfig(configPath: string): LoadResult {
     }
   }
 
+  // Where new sub-sandboxes go: next to the default sandbox unless configured.
+  let sandboxesDir = sandboxRoot ? path.dirname(sandboxRoot) : "";
+  if (raw.sandboxes_dir !== undefined) {
+    if (typeof raw.sandboxes_dir !== "string" || raw.sandboxes_dir.trim() === "") {
+      problems.push("sandboxes_dir: ожидается путь к папке.");
+    } else {
+      sandboxesDir = path.resolve(projectRoot, raw.sandboxes_dir.trim());
+      if (isInside(sandboxesDir, projectRoot)) {
+        problems.push(`sandboxes_dir: папка подпесочниц (${sandboxesDir}) не может лежать внутри проекта.`);
+      }
+    }
+  }
+
   const sync = parseSync(raw, problems, warnings);
   const replacements = parseReplacements(raw, problems, warnings);
 
@@ -223,6 +236,7 @@ export function loadConfig(configPath: string): LoadResult {
       projectRoot,
       configPath: path.resolve(configPath),
       profile: { name: "default", sandboxRoot },
+      sandboxesDir,
       sync,
       replacements,
     },
