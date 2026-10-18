@@ -86,6 +86,8 @@ describe("App: sub-sandbox workflow end to end", () => {
     press("feature-x");
     await until(() => out.screen.includes("папка"), "preview of the new folder");
     press("\r");
+    await until(() => out.screen.includes("создать и переключиться"), "create: switch or not");
+    press("\r");
     await until(
       () => out.screen.includes("feature-x ⎇ feature-x") && out.screen.includes("синхронизация активна"),
       "switched to feature-x"
@@ -111,5 +113,21 @@ describe("App: sub-sandbox workflow end to end", () => {
     expect(bench.git("branch", "--show-current")).toBe("master");
     expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 1; // BIGcorpProject\n");
     expect(ws.registry.get("feature-x")!.stash).toMatch(/^anonymus:feature-x:/);
+
+    // b → n → name → Enter → s: a sub-sandbox off master, the project stays put.
+    press("b");
+    await until(() => out.screen.includes("Подпесочницы"), "sandboxes screen, third time");
+    press("n");
+    await until(() => out.screen.includes("Имя новой ветки"), "name input again");
+    press("agent-y");
+    await until(() => out.screen.includes("agent-y"), "typed name");
+    press("\r");
+    await until(() => out.screen.includes("создать, не переключаясь"), "create choice");
+    press("s");
+    await until(() => out.screen.includes("«agent-y» создана от master"), "created without switching");
+    expect(bench.git("branch", "--show-current")).toBe("master");
+    expect(fs.readFileSync(path.join(path.dirname(bench.sandbox), "agent-y", "MyProject", "main.c"), "utf8")).toBe(
+      "int v = 1; // MyProject\n"
+    );
   }, 60000);
 });

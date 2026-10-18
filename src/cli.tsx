@@ -8,6 +8,7 @@ import { SERVICE_DIR } from "./config/schema.js";
 import { CONFIG_TEMPLATE } from "./config/template.js";
 import type { SyncEngine } from "./core/engine.js";
 import { acquireLock } from "./core/lock.js";
+import { defaultMergeSources, prepareMerge } from "./core/mergePrep.js";
 import { Workspace } from "./core/workspace.js";
 import { applyReconcile, planReconcile, type Strategy } from "./core/reconcile.js";
 import { KIND_LABEL, scan } from "./core/scanner.js";
@@ -26,9 +27,17 @@ const HELP = `anonymus — автоматическая синхронизаци
 
 Подпесочницы (по одной на git-ветку проекта):
   anonymus sandboxes                  список
-  anonymus sandbox new <имя>          новая ветка от текущей + подпесочница
+  anonymus sandbox new <имя> [--from <ветка>] [--no-switch]
+                                      новая ветка (от текущей или --from) + подпесочница;
+                                      --no-switch: проект не переключать, папку заполнить из ветки
   anonymus sandbox switch <имя>       переключить проект на ветку подпесочницы
   anonymus sandbox remove <имя>       удалить подпесочницу (папка в корзину)
+
+Слияние работы нескольких агентов:
+  anonymus merge <цель> [<источник>...]
+                                      патчи работы источников (по умолчанию — ветки,
+                                      созданные от цели) в <цель>/.anonymus-merge/
+  anonymus commit [-m <сообщение>]    закоммитить работу активной подпесочницы
 
 Опции:
   -c, --config <файл>   путь к конфигу (по умолчанию ./anonymus.yaml)
@@ -41,9 +50,14 @@ const HELP = `anonymus — автоматическая синхронизаци
 type SandboxAction = "new" | "switch" | "remove";
 
 interface Args {
-  command: "start" | "init" | "scan" | "sandboxes" | "sandbox";
+  command: "start" | "init" | "scan" | "sandboxes" | "sandbox" | "merge" | "commit";
   sandboxAction?: SandboxAction;
   sandboxName?: string;
+  from?: string;
+  noSwitch?: boolean;
+  mergeTarget?: string;
+  mergeSources?: string[];
+  message?: string;
   config?: string;
   tui: boolean;
   strategy?: Strategy;
@@ -83,6 +97,24 @@ function parseArgs(argv: string[]): Args {
       args.command = "sandbox";
       args.sandboxAction = action;
       args.sandboxName = name;
+    } else if (a === "merge") {
+      args.command = "merge";
+      args.mergeTarget = argv[++i];
+      if (!args.mergeTarget || args.mergeTarget.startsWith("-")) {
+        fail("merge: укажите подпесочницу-цель, в которую сливать");
+      }
+      args.mergeSources = [];
+      while (i + 1 < argv.length && !argv[i + 1].startsWith("-")) {
+        args.mergeSources.push(argv[++i]);
+      }
+    } else if (a === "commit") {
+      args.command = "commit";
+    } else if (a === "--from") {
+      args.from = argv[++i];
+    } else if (a === "--no-switch") {
+      args.noSwitch = true;
+    } else if (a === "-m" || a === "--message") {
+      args.message = argv[++i];
     } else if (a === "-c" || a === "--config") {
       args.config = argv[++i];
     } else if (a === "--no-tui") {
@@ -173,12 +205,16 @@ function printSandboxes(workspace: Workspace): void {
   }
 }
 
-function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: string): void {
+function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: string, args: Args): void {
   const step = (m: string) => console.log(`  … ${m}`);
   try {
     let warnings: string[] = [];
     if (action === "new") {
-      warnings = workspace.create(name, step).warnings;
+      const created = workspace.create(name, { from: args.from, switchTo: !args.noSwitch }, step);
+      warnings = created.warnings;
+      if (args.noSwitch) {
+        console.log(`  … в подпесочницу записано файлов: ${created.filled}`);
+      }
     } else if (action === "switch") {
       warnings = workspace.switchTo(name, step);
     } else {
@@ -260,7 +296,37 @@ async function main(): Promise<void> {
   process.on("exit", lock.release);
 
   if (args.command === "sandbox") {
-    runSandboxCommand(workspace, args.sandboxAction!, args.sandboxName!);
+    runSandboxCommand(workspace, args.sandboxAction!, args.sandboxName!, args);
+    return;
+  }
+  if (args.command === "merge") {
+    const target = args.mergeTarget!;
+    const sources = args.mergeSources!.length ? args.mergeSources! : defaultMergeSources(workspace, target);
+    try {
+      const { dir, sources: results } = prepareMerge(workspace, target, sources);
+      for (const r of results) {
+        console.log(
+          `${r.name.padEnd(24)} изменено ${r.modified}, добавлено ${r.added}, удалено ${r.deleted}` +
+            (r.binary ? `, бинарных ${r.binary}` : "") +
+            (r.leaks.length ? `  ⚠ утечка: ${r.leaks.join(", ")}` : "")
+        );
+      }
+      console.log(`Патчи: ${dir}\nСкажите агенту в «${target}» применить .anonymus-merge/*.patch.`);
+    } catch (e) {
+      fail(`Ошибка: ${(e as Error).message}`, 1);
+    }
+    return;
+  }
+  if (args.command === "commit") {
+    try {
+      const message = args.message ?? workspace.defaultCommitMessage();
+      if (!workspace.commitActive(message)) {
+        fail("нечего коммитить — незакоммиченных изменений нет", 1);
+      }
+      console.log(`закоммичено в ${workspace.active.branch}: ${message}`);
+    } catch (e) {
+      fail(`Ошибка: ${(e as Error).message}`, 1);
+    }
     return;
   }
 

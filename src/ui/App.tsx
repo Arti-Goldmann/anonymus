@@ -14,7 +14,8 @@ import { ConflictView } from "./ConflictView.js";
 import { CompactHeader, Header, HEADER_MIN_COLUMNS, HEADER_ROWS } from "./Header.js";
 import { LIVE_CHROME_ROWS, LiveView, type LiveStatus } from "./LiveView.js";
 import { RECONCILE_COMPACT_ROWS, RECONCILE_FULL_ROWS, ReconcileView } from "./ReconcileView.js";
-import { SandboxesView } from "./SandboxesView.js";
+import { SandboxesView, type ActionResult } from "./SandboxesView.js";
+import { prepareMerge } from "../core/mergePrep.js";
 import { formatTime, theme } from "./theme.js";
 import { useTerminalSize } from "./useTerminalSize.js";
 
@@ -249,23 +250,83 @@ export function App({
     (name: string) => void runSwitch(`переключаюсь на «${name}»`, (step) => workspace.switchTo(name, step)),
     [runSwitch, workspace]
   );
+  /** Run a sub-sandbox action that does not switch branches; errors become a result. */
+  const attempt = useCallback(
+    (action: () => ActionResult): ActionResult => {
+      try {
+        return action();
+      } catch (e) {
+        pushEvent({ time: now(), kind: "error", message: (e as Error).message });
+        return { ok: false, lines: [(e as Error).message] };
+      }
+    },
+    [pushEvent]
+  );
+
   const createSandbox = useCallback(
-    (name: string) =>
-      void runSwitch(`создаю подпесочницу «${name}»`, (step) => workspace.create(name, step).warnings),
-    [runSwitch, workspace]
+    (name: string, from: string, switchToIt: boolean): ActionResult | void => {
+      if (switchToIt) {
+        void runSwitch(`создаю подпесочницу «${name}» от ${from}`, (step) =>
+          workspace.create(name, { from, switchTo: true }, step).warnings
+        );
+        return;
+      }
+      // The project stays on its branch: the new sub-sandbox is filled from git.
+      return attempt(() => {
+        const { entry, filled } = workspace.create(name, { from, switchTo: false });
+        const folder = workspace.registry.absPath(entry);
+        info(`создана подпесочница «${name}» ⎇ ${name} от ${from}: ${filled} файлов в ${folder}`);
+        return { ok: true, lines: [`«${name}» создана от ${from}: ${filled} файлов`, `папка ${folder} — агента можно запускать`] };
+      });
+    },
+    [runSwitch, workspace, attempt, info]
   );
   const removeSandbox = useCallback(
-    (name: string) => {
-      try {
+    (name: string): ActionResult =>
+      attempt(() => {
         const { trashDir, warnings: w } = workspace.remove(name);
         w.forEach(warn);
         info(`подпесочница «${name}» удалена (папка в ${path.relative(workspace.config.projectRoot, trashDir)}), ветка оставлена`);
-        return { ok: true, message: `«${name}» удалена, папка в корзине` };
-      } catch (e) {
-        return { ok: false, message: (e as Error).message };
-      }
-    },
-    [workspace, warn, info]
+        return { ok: true, lines: [`«${name}» удалена, папка в корзине`, ...w] };
+      }),
+    [workspace, attempt, warn, info]
+  );
+  const prepareMergeInto = useCallback(
+    (target: string, sources: string[]): ActionResult =>
+      attempt(() => {
+        const { dir, sources: results } = prepareMerge(workspace, target, sources);
+        const lines = results.map(
+          (r) =>
+            `${r.name}: изменено ${r.modified}, добавлено ${r.added}, удалено ${r.deleted}` +
+            (r.binary ? `, бинарных ${r.binary}` : "") +
+            (r.leaks.length ? ` — ⚠ утечка: ${r.leaks.join(", ")}` : "")
+        );
+        for (const r of results) {
+          if (r.leaks.length) warn(`возможная утечка в ${r.patch}: ${r.leaks.join(", ")}`);
+        }
+        info(`подготовлено слияние в «${target}»: ${sources.join(", ")}`);
+        return {
+          ok: true,
+          lines: [
+            `Патчи готовы: ${dir}`,
+            ...lines,
+            `Скажите агенту в «${target}» применить .anonymus-merge/*.patch; потом k — закоммитить итог.`,
+          ],
+        };
+      }),
+    [workspace, attempt, warn, info]
+  );
+  const commitActive = useCallback(
+    (message: string): ActionResult =>
+      attempt(() => {
+        const branch = workspace.active.branch;
+        if (!workspace.commitActive(message)) {
+          return { ok: false, lines: ["нечего коммитить — незакоммиченных изменений нет"] };
+        }
+        info(`коммит в ${branch}: ${message}`);
+        return { ok: true, lines: [`закоммичено в ${branch}: ${message}`, `в main: git checkout main && git merge ${branch}`] };
+      }),
+    [workspace, attempt, info]
   );
 
   const quit = useCallback(() => {
@@ -384,6 +445,8 @@ export function App({
             onSwitch={switchTo}
             onCreate={createSandbox}
             onRemove={removeSandbox}
+            onPrepareMerge={prepareMergeInto}
+            onCommit={commitActive}
             onBack={() => setScreen("live")}
           />
         )}

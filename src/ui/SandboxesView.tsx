@@ -3,18 +3,28 @@ import * as path from "node:path";
 import { useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
+import { defaultMergeSources } from "../core/mergePrep.js";
 import type { Workspace } from "../core/workspace.js";
 import { plural, theme } from "./theme.js";
 
+export interface ActionResult {
+  ok: boolean;
+  lines: string[];
+}
+
 type Mode =
   | { kind: "list" }
-  | { kind: "new"; value: string; error: string | null }
+  | { kind: "new"; value: string; base: number; error: string | null }
+  | { kind: "new-confirm"; name: string; from: string }
   | { kind: "confirm-delete"; name: string }
-  | { kind: "confirm-switch"; name: string };
+  | { kind: "confirm-switch"; name: string }
+  | { kind: "merge"; target: string; sources: string[]; picked: Set<string>; index: number }
+  | { kind: "commit"; value: string };
 
 /**
  * Sub-sandboxes of the project: one per git branch. Switch (Enter), create a
- * new one for a new branch (n), remove an inactive one (d).
+ * new one off any branch (n), remove (d), prepare the work of other
+ * sub-sandboxes for merging into the selected one (m), commit the active one (k).
  */
 export function SandboxesView({
   workspace,
@@ -23,27 +33,33 @@ export function SandboxesView({
   onSwitch,
   onCreate,
   onRemove,
+  onPrepareMerge,
+  onCommit,
   onBack,
 }: {
   workspace: Workspace;
   heldCount: number;
   maxItems: number;
   onSwitch: (name: string) => void;
-  onCreate: (name: string) => void;
-  onRemove: (name: string) => { ok: boolean; message: string };
+  onCreate: (name: string, from: string, switchTo: boolean) => ActionResult | void;
+  onRemove: (name: string) => ActionResult;
+  onPrepareMerge: (target: string, sources: string[]) => ActionResult;
+  onCommit: (message: string) => ActionResult;
   onBack: () => void;
 }) {
   const list = workspace.registry.list();
   const activeName = workspace.active.name;
+  const bases = workspace.baseBranchChoices();
   const [index, setIndex] = useState(() => Math.max(0, list.findIndex((s) => s.name === activeName)));
   const [mode, setMode] = useState<Mode>({ kind: "list" });
-  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [result, setResult] = useState<ActionResult | null>(null);
   const selected = list[Math.min(index, list.length - 1)];
   const first = Math.max(0, Math.min(index - Math.floor(maxItems / 2), list.length - maxItems));
+  const show = (r: ActionResult) => setResult(r);
 
   const requestSwitch = (name: string) => {
     if (name === activeName) {
-      setMessage({ ok: true, text: `«${name}» уже активна` });
+      show({ ok: true, lines: [`«${name}» уже активна`] });
     } else if (heldCount > 0) {
       setMode({ kind: "confirm-switch", name });
     } else {
@@ -51,13 +67,33 @@ export function SandboxesView({
     }
   };
 
+  const startMerge = () => {
+    if (!selected?.branch) {
+      show({ ok: false, lines: ["у этой подпесочницы нет ветки"] });
+      return;
+    }
+    const sources = list.filter((s) => s.name !== selected.name && s.branch).map((s) => s.name);
+    if (sources.length === 0) {
+      show({ ok: false, lines: ["нет других подпесочниц, работу которых можно слить"] });
+      return;
+    }
+    setResult(null);
+    setMode({
+      kind: "merge",
+      target: selected.name,
+      sources,
+      picked: new Set(defaultMergeSources(workspace, selected.name)),
+      index: 0,
+    });
+  };
+
+  // List and simple confirmations.
   useInput(
     (input, key) => {
       if (mode.kind === "confirm-delete" || mode.kind === "confirm-switch") {
         if (input === "y" || input === "н" || key.return) {
           if (mode.kind === "confirm-delete") {
-            const r = onRemove(mode.name);
-            setMessage({ ok: r.ok, text: r.message });
+            show(onRemove(mode.name));
             setIndex((i) => Math.max(0, Math.min(i, list.length - 2)));
           } else {
             onSwitch(mode.name);
@@ -66,6 +102,39 @@ export function SandboxesView({
         } else if (input === "n" || input === "т" || key.escape) {
           setMode({ kind: "list" });
         }
+        return;
+      }
+      if (mode.kind === "new-confirm") {
+        if (key.return) {
+          onCreate(mode.name, mode.from, true);
+        } else if (input === "s" || input === "ы") {
+          const r = onCreate(mode.name, mode.from, false);
+          if (r) show(r);
+          setMode({ kind: "list" });
+        } else if (key.escape) {
+          setMode({ kind: "list" });
+        }
+        return;
+      }
+      if (mode.kind === "merge") {
+        if (key.escape) {
+          setMode({ kind: "list" });
+        } else if (key.upArrow) {
+          setMode({ ...mode, index: Math.max(0, mode.index - 1) });
+        } else if (key.downArrow) {
+          setMode({ ...mode, index: Math.min(mode.sources.length - 1, mode.index + 1) });
+        } else if (input === " ") {
+          const picked = new Set(mode.picked);
+          const name = mode.sources[mode.index];
+          picked.has(name) ? picked.delete(name) : picked.add(name);
+          setMode({ ...mode, picked });
+        } else if (key.return) {
+          show(onPrepareMerge(mode.target, mode.sources.filter((s) => mode.picked.has(s))));
+          setMode({ kind: "list" });
+        }
+        return;
+      }
+      if (mode.kind !== "list") {
         return;
       }
       if (key.escape || input === "q" || input === "й") {
@@ -77,28 +146,37 @@ export function SandboxesView({
       } else if (key.return && selected) {
         requestSwitch(selected.name);
       } else if (input === "n" || input === "т") {
-        setMessage(null);
-        setMode({ kind: "new", value: "", error: workspace.gitEnabled ? null : workspace.validateNewName("x") });
+        setResult(null);
+        setMode({ kind: "new", value: "", base: 0, error: workspace.gitEnabled ? null : workspace.validateNewName("x") });
       } else if ((input === "d" || input === "в") && selected) {
         if (selected.name === activeName) {
-          setMessage({ ok: false, text: "активную подпесочницу удалить нельзя — сначала переключитесь на другую" });
+          show({ ok: false, lines: ["активную подпесочницу удалить нельзя — сначала переключитесь на другую"] });
         } else {
           setMode({ kind: "confirm-delete", name: selected.name });
         }
+      } else if (input === "m" || input === "ь") {
+        startMerge();
+      } else if (input === "k" || input === "л") {
+        setResult(null);
+        setMode({ kind: "commit", value: workspace.defaultCommitMessage() });
       }
     },
-    { isActive: mode.kind !== "new" }
+    { isActive: mode.kind !== "new" && mode.kind !== "commit" }
   );
 
-  // Esc leaves the name input (TextInput itself handles the other keys).
+  // Text inputs: Esc leaves, Tab cycles the base branch of a new sub-sandbox.
   useInput(
     (_input, key) => {
       if (key.escape) {
         setMode({ kind: "list" });
+      } else if (key.tab && mode.kind === "new" && bases.length > 1) {
+        setMode({ ...mode, base: (mode.base + 1) % bases.length });
       }
     },
-    { isActive: mode.kind === "new" }
+    { isActive: mode.kind === "new" || mode.kind === "commit" }
   );
+
+  const from = mode.kind === "new" ? bases[mode.base] ?? "HEAD" : "";
 
   return (
     <Box flexDirection="column">
@@ -118,9 +196,11 @@ export function SandboxesView({
                 <Text color={isActive ? theme.ok : theme.muted}>{isActive ? "● " : "○ "}</Text>
                 <Text bold={isActive}>{s.name}</Text>
                 <Text color={theme.muted}>
-                  {"  "}⎇ {s.branch ?? "—"}  {path.basename(workspace.registry.absPath(s))}
+                  {"  "}⎇ {s.branch ?? "—"}
+                  {s.base ? ` от ${s.base.branch}` : ""}  {path.basename(workspace.registry.absPath(s))}
                 </Text>
                 {s.stash && <Text color={theme.warn}>  есть stash</Text>}
+                {s.mergeSources?.length ? <Text color={theme.info}>  слияние готово</Text> : null}
                 {missing && <Text color={theme.error}>  папка не найдена</Text>}
               </Text>
             );
@@ -139,25 +219,78 @@ export function SandboxesView({
             <Text color={theme.accent}>Имя новой ветки и подпесочницы: </Text>
             <TextInput
               value={mode.value}
-              onChange={(value) => setMode({ kind: "new", value, error: null })}
+              onChange={(value) => setMode({ ...mode, value, error: null })}
               onSubmit={(value) => {
                 const error = workspace.validateNewName(value);
                 if (error) {
-                  setMode({ kind: "new", value, error });
+                  setMode({ ...mode, value, error });
                 } else {
-                  onCreate(value.trim());
+                  setMode({ kind: "new-confirm", name: value.trim(), from });
                 }
               }}
             />
           </Box>
+          <Text>
+            <Text color={theme.muted}>от ветки: </Text>
+            <Text bold>{from}</Text>
+            {bases.length > 1 && <Text color={theme.muted}>   (Tab — другая)</Text>}
+          </Text>
           {mode.value.trim() && (
             <Text color={theme.muted} wrap="truncate-middle">
-              ветка {mode.value.trim()} от {workspace.git?.currentBranch() ?? "HEAD"} · папка{" "}
-              {workspace.folderFor(mode.value.trim())}
+              папка {workspace.folderFor(mode.value.trim())}
             </Text>
           )}
           {mode.error && <Text color={theme.error}>{mode.error}</Text>}
-          <Text color={theme.muted}>Enter — создать и переключиться · Esc — отмена</Text>
+          <Text color={theme.muted}>Enter — дальше · Esc — отмена</Text>
+        </Box>
+      )}
+
+      {mode.kind === "new-confirm" && (
+        <Box flexDirection="column" marginTop={1} paddingX={1}>
+          <Text>
+            Новая подпесочница <Text bold>{mode.name}</Text> от ветки <Text bold>{mode.from}</Text>
+          </Text>
+          <Text>
+            <Text color={theme.accent}>Enter</Text> создать и переключиться · <Text color={theme.accent}>s</Text>{" "}
+            создать, не переключаясь (папка заполнится из ветки) · <Text color={theme.accent}>Esc</Text> отмена
+          </Text>
+        </Box>
+      )}
+
+      {mode.kind === "merge" && (
+        <Box flexDirection="column" marginTop={1} paddingX={1}>
+          <Text>
+            Слить в <Text bold>{mode.target}</Text> работу подпесочниц:
+          </Text>
+          {mode.sources.map((name, i) => {
+            const s = workspace.registry.get(name)!;
+            return (
+              <Text key={name} color={i === mode.index ? theme.accent : undefined} wrap="truncate-end">
+                {i === mode.index ? "❯ " : "  "}[{mode.picked.has(name) ? "x" : " "}] {name}
+                <Text color={theme.muted}>  ⎇ {s.branch}{s.base ? ` от ${s.base.branch}` : ""}</Text>
+              </Text>
+            );
+          })}
+          <Text color={theme.muted} wrap="truncate-end">
+            пробел — отметить · Enter — подготовить патчи в .anonymus-merge/ · Esc — отмена
+          </Text>
+        </Box>
+      )}
+
+      {mode.kind === "commit" && (
+        <Box flexDirection="column" marginTop={1} paddingX={1}>
+          <Box>
+            <Text color={theme.accent}>Коммит в {workspace.active.branch}: </Text>
+            <TextInput
+              value={mode.value}
+              onChange={(value) => setMode({ kind: "commit", value })}
+              onSubmit={(value) => {
+                show(onCommit(value.trim() || workspace.defaultCommitMessage()));
+                setMode({ kind: "list" });
+              }}
+            />
+          </Box>
+          <Text color={theme.muted}>Enter — закоммитить незакоммиченную работу активной подпесочницы · Esc — отмена</Text>
         </Box>
       )}
 
@@ -186,9 +319,13 @@ export function SandboxesView({
 
       {mode.kind === "list" && (
         <Box flexDirection="column" marginTop={1} paddingX={1}>
-          {message && <Text color={message.ok ? theme.ok : theme.error}>{message.text}</Text>}
+          {result?.lines.map((line, i) => (
+            <Text key={i} color={result.ok ? (i === 0 ? theme.ok : undefined) : theme.error} wrap="truncate-end">
+              {line}
+            </Text>
+          ))}
           <Text color={theme.muted} wrap="truncate-end">
-            Enter переключиться · n новая · d удалить · ↑↓ выбрать · Esc назад
+            Enter переключиться · n новая · m слить сюда · k коммит · d удалить · Esc назад
           </Text>
         </Box>
       )}

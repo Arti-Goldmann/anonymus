@@ -316,11 +316,22 @@ export class SyncEngine {
 
   /** Copy a file from `from` to the other side, transforming text. */
   copy(from: Side, canonical: string): TransferResult {
-    const to = otherSide(from);
     const src = this.read(from, canonical);
     if (!src) {
       throw new Error(`${this.mapper.sidePath(from, canonical)}: файла нет`);
     }
+    const result = this.writeTransformed(from, canonical, src);
+    this.record(canonical);
+    return result;
+  }
+
+  /**
+   * Write `src` — the bytes of a file as it is on side `from` — to the other
+   * side, transformed. Does not record sync state; used directly to fill a
+   * sub-sandbox from a git commit without checking it out.
+   */
+  writeTransformed(from: Side, canonical: string, src: Buffer): TransferResult {
+    const to = otherSide(from);
     const result: TransferResult = {
       canonical,
       from,
@@ -350,7 +361,6 @@ export class SyncEngine {
       }
       result.backup = this.writeText(to, canonical, transformed.text, decoded, result.warnings);
     }
-    this.record(canonical);
     return result;
   }
 

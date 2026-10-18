@@ -5,8 +5,11 @@ import { SERVICE_DIR, type SyncRules } from "../config/schema.js";
 // NodeNext the typings expose it as `.default` (which also exists at runtime).
 const ignore = ignoreModule.default;
 
+/** Folder in a sub-sandbox with prepared merge patches (see core/mergePrep.ts). */
+export const MERGE_DIR = ".anonymus-merge";
+
 /** Never synced, whatever the config says. */
-const ALWAYS_EXCLUDED = [".git/", `${SERVICE_DIR}/`, "anonymus.yaml", ".anonymus.yaml"];
+const ALWAYS_EXCLUDED = [".git/", `${SERVICE_DIR}/`, `${MERGE_DIR}/`, "anonymus.yaml", ".anonymus.yaml"];
 
 /**
  * Decides which files take part in the sync. All patterns use `.gitignore`

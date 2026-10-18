@@ -20,19 +20,24 @@ export class Git {
   constructor(readonly cwd: string) {}
 
   private run(args: string[]): string {
+    return this.exec(args).toString("utf8").trimEnd();
+  }
+
+  /** Run git and return raw stdout (file contents are binary-safe). */
+  private exec(args: string[]): Buffer {
     try {
       return execFileSync("git", args, {
         cwd: this.cwd,
-        encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
-      }).trimEnd();
+        maxBuffer: 256 * 1024 * 1024,
+      });
     } catch (e) {
-      const err = e as { stderr?: string; stdout?: string; code?: string; message: string };
+      const err = e as { stderr?: Buffer; stdout?: Buffer; code?: string; message: string };
       if (err.code === "ENOENT") {
         throw new GitError("git не найден в PATH");
       }
-      const out = `${err.stderr ?? ""}${err.stdout ?? ""}`.trim();
+      const out = `${err.stderr?.toString("utf8") ?? ""}${err.stdout?.toString("utf8") ?? ""}`.trim();
       throw new GitError(`git ${args[0]}: ${out.split("\n")[0] || err.message}`, out);
     }
   }
@@ -75,9 +80,51 @@ export class Git {
     }
   }
 
-  /** Create a branch at HEAD without switching to it. */
-  createBranch(name: string): void {
-    this.run(["branch", name]);
+  /** Create a branch at `from` (HEAD by default) without switching to it. */
+  createBranch(name: string, from?: string): void {
+    this.run(from ? ["branch", name, from] : ["branch", name]);
+  }
+
+  /** Commit id a ref points to. */
+  commitOf(ref: string): string {
+    return this.run(["rev-parse", "--verify", `${ref}^{commit}`]);
+  }
+
+  /** Common ancestor of two refs. */
+  mergeBase(a: string, b: string): string {
+    return this.run(["merge-base", a, b]);
+  }
+
+  /** All file paths (POSIX) stored in a commit. */
+  listFiles(commit: string): string[] {
+    // -z: raw NUL-separated paths, no quoting of non-ASCII names.
+    return this.exec(["ls-tree", "-r", "-z", "--name-only", commit])
+      .toString("utf8")
+      .split("\0")
+      .filter(Boolean);
+  }
+
+  /** Raw bytes of a file in a commit. */
+  readFile(commit: string, filePath: string): Buffer {
+    return this.exec(["cat-file", "blob", `${commit}:${filePath}`]);
+  }
+
+  /**
+   * Commit all uncommitted work (tracked and new files) except anonymus' own
+   * files. Returns false when there was nothing to commit.
+   */
+  commitAll(message: string): boolean {
+    if (!this.isDirty()) {
+      return false;
+    }
+    this.run(["add", "--all", "--", ".", ...this.ownExcludes()]);
+    this.run(["commit", "--quiet", "--message", message]);
+    return true;
+  }
+
+  /** Pathspecs that keep anonymus' own config / service folder out of git operations. */
+  private ownExcludes(): string[] {
+    return OWN_PATHS.map((p) => `:(exclude)${p.replace(/\/$/, "")}`);
   }
 
   checkout(name: string): void {
@@ -99,8 +146,7 @@ export class Git {
    * while branches are switched.
    */
   stashPush(label: string): void {
-    const exclude = OWN_PATHS.map((p) => `:(exclude)${p.replace(/\/$/, "")}`);
-    this.run(["stash", "push", "--include-untracked", "--message", label, "--", ".", ...exclude]);
+    this.run(["stash", "push", "--include-untracked", "--message", label, "--", ".", ...this.ownExcludes()]);
   }
 
   /** `stash@{n}` of the newest stash whose message contains `label`, if any. */

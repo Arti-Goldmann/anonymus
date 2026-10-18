@@ -11,6 +11,10 @@ export interface SandboxEntry {
   branch: string | null;
   /** Label of the git stash holding this branch's uncommitted work, if any. */
   stash: string | null;
+  /** Branch and commit this sub-sandbox was created from (common ancestor for merging). */
+  base?: { branch: string; commit: string } | null;
+  /** Sub-sandboxes whose work was last prepared for merging into this one. */
+  mergeSources?: string[] | null;
   createdAt: string;
 }
 
@@ -97,12 +101,18 @@ export class Registry {
     this.data.active = name;
   }
 
-  add(entry: { name: string; absPath: string; branch: string | null }): SandboxEntry {
+  add(entry: {
+    name: string;
+    absPath: string;
+    branch: string | null;
+    base?: { branch: string; commit: string } | null;
+  }): SandboxEntry {
     const created: SandboxEntry = {
       name: entry.name,
       path: this.toStored(entry.absPath),
       branch: entry.branch,
       stash: null,
+      base: entry.base ?? null,
       createdAt: new Date().toISOString(),
     };
     this.data.sandboxes.push(created);

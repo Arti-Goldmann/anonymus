@@ -184,22 +184,96 @@ export class Workspace {
     return warnings;
   }
 
-  /** New branch from HEAD + new sub-sandbox for it, then switch to it. */
-  create(name: string, step: StepReporter = () => {}): { entry: SandboxEntry; warnings: string[] } {
+  /** Branches a new sub-sandbox can be created from: the current one first. */
+  baseBranchChoices(): string[] {
+    const current = this.git?.currentBranch();
+    const branches = this.registry.list().map((s) => s.branch).filter((b): b is string => !!b);
+    return [...new Set([...(current ? [current] : []), ...branches])];
+  }
+
+  /**
+   * New branch from `from` (the current branch by default) plus a new
+   * sub-sandbox for it. With `switchTo` (default) the project switches to the
+   * new branch; without it the sub-sandbox is filled straight from the branch's
+   * commit and the project stays where it is — handy to set up several agent
+   * branches off one parent in a row.
+   */
+  create(
+    name: string,
+    options: { from?: string; switchTo?: boolean } = {},
+    step: StepReporter = () => {}
+  ): { entry: SandboxEntry; warnings: string[]; filled: number } {
     const n = name.trim();
     const problem = this.validateNewName(n);
     if (problem) {
       throw new Error(problem);
     }
-    step(`создаю ветку ${n} от ${this.git!.currentBranch() ?? "HEAD"}`);
-    this.git!.createBranch(n);
+    const git = this.git!;
+    const from = options.from ?? git.currentBranch() ?? "HEAD";
+    if (from !== "HEAD" && !git.branchExists(from)) {
+      throw new Error(`нет ветки ${from}`);
+    }
+    const commit = git.commitOf(from);
+    step(`создаю ветку ${n} от ${from}`);
+    git.createBranch(n, from);
     const folder = this.folderFor(n);
     step(`создаю папку ${folder}`);
     fs.mkdirSync(folder, { recursive: true });
-    const entry = this.registry.add({ name: n, absPath: folder, branch: n });
+    const entry = this.registry.add({
+      name: n,
+      absPath: folder,
+      branch: n,
+      base: from === "HEAD" ? null : { branch: from, commit },
+    });
     this.registry.save();
-    const warnings = this.switchTo(n, step);
-    return { entry, warnings };
+
+    if (options.switchTo === false) {
+      step(`заполняю подпесочницу из ${from} (без переключения проекта)`);
+      return { entry, warnings: [], filled: this.fillFromCommit(entry, commit) };
+    }
+    return { entry, warnings: this.switchTo(n, step), filled: 0 };
+  }
+
+  /**
+   * Write the files of a commit into a sub-sandbox, anonymized, without
+   * touching the project. No sync state is recorded: when the sub-sandbox
+   * becomes active, the scan finds both sides equal and records them then.
+   */
+  private fillFromCommit(entry: SandboxEntry, commit: string): number {
+    const engine = this.engineFor(entry);
+    let count = 0;
+    for (const file of this.git!.listFiles(commit)) {
+      if (!engine.filter.isSynced(file) || engine.mapper.projectPathProblem(file)) {
+        continue;
+      }
+      engine.writeTransformed("project", file, this.git!.readFile(commit, file));
+      count++;
+    }
+    return count;
+  }
+
+  /** Commit message suggested for the active sub-sandbox's work. */
+  defaultCommitMessage(): string {
+    const active = this.registry.active;
+    return active.mergeSources?.length
+      ? `Слияние: ${active.mergeSources.join(", ")}`
+      : `Изменения подпесочницы ${active.name}`;
+  }
+
+  /**
+   * Commit everything uncommitted on the active branch (anonymus' own files
+   * excluded). Returns false when there was nothing to commit.
+   */
+  commitActive(message = this.defaultCommitMessage()): boolean {
+    if (!this.git) {
+      throw new Error("проект не является git-репозиторием");
+    }
+    const committed = this.git.commitAll(message);
+    if (committed && this.registry.active.mergeSources) {
+      this.registry.active.mergeSources = null;
+      this.registry.save();
+    }
+    return committed;
   }
 
   /**
