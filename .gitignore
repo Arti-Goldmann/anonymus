@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tgz
+
+# Local test configs / state never belong in git
+anonymus.yaml
+.anonymus/
+
+# Demo stand (npm run demo)
+demo/
