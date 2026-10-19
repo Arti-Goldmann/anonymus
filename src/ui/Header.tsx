@@ -8,8 +8,8 @@ const MASCOT_LINES = renderMascot();
 
 /** Rows taken by the full header (mascot + blank line below). */
 export const HEADER_ROWS = MASCOT_SPRITE.length / 2 + 1;
-/** Narrowest window the full header fits into. */
-export const HEADER_MIN_COLUMNS = 90;
+/** Narrowest window the full header fits into (paths are shortened in the middle). */
+export const HEADER_MIN_COLUMNS = 60;
 
 export interface PairsSummary {
   total: number;
@@ -56,7 +56,7 @@ export function Header({ config, version, summary }: { config: AnonymusConfig; v
   );
 }
 
-/** One-line header for small windows (and once files start moving). */
+/** One-line header for windows too small for the mascot. */
 export function CompactHeader({ config, version, summary }: { config: AnonymusConfig; version: string; summary: PairsSummary }) {
   return (
     <Box flexShrink={0}>

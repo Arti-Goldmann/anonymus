@@ -37,7 +37,7 @@ ${(globalThis as { __screen?: () => string }).__screen?.() ?? ""}`);
   }
 }
 
-const MASCOT_ROW = /▀{20,}/; // a full mascot row is a long run of half blocks
+const MASCOT_ROW = /▀{14,}/; // the mascot's top row is a run of half blocks
 
 describe("App: pairs of sub-sandbox ⇄ worktree", () => {
   let bench: Bench;
@@ -86,11 +86,11 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
     expect(fs.readFileSync(sandboxMain, "utf8")).toBe("int v = 1; // MyProject\n");
     expect(bench.git("branch", "--show-current")).toBe("master"); // the main folder is never touched
 
-    // An agent edit reaches the worktree; the first transfer folds the mascot.
+    // An agent edit reaches the worktree; the mascot stays (only a small window hides it).
     fs.writeFileSync(sandboxMain, "int v = 2; // MyProject\n");
     const worktreeMain = path.join(entry.projectDir, "BIGcorpProject", "main.c");
     await until(() => fs.readFileSync(worktreeMain, "utf8") === "int v = 2; // BIGcorpProject\n", "sync to worktree");
-    await until(() => !MASCOT_ROW.test(out.screen), "mascot folded");
+    expect(out.screen).toMatch(MASCOT_ROW);
 
     // The worktree is removed with git behind anonymus' back: the pair stops, the sandbox is intact.
     bench.git("worktree", "remove", "--force", entry.projectDir);
@@ -112,4 +112,17 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
     await until(() => out.screen.includes("синхронно"), "live again");
     expect(fs.readFileSync(worktreeMain, "utf8")).toBe("int v = 2; // BIGcorpProject\n");
   }, 60000);
+
+  it("shows the mascot while there is room and a one-line header in a small window", async () => {
+    bench = makeBench();
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1;\n");
+    const { out } = startApp(new Workspace(bench.config()));
+    await until(() => out.screen.includes("синхронно"), "live");
+    expect(out.screen).toMatch(MASCOT_ROW);
+
+    out.rows = 14; // shrink the window
+    out.emit("resize");
+    await until(() => out.screen.includes("▀▄ anonymus"), "compact header");
+    expect(out.screen).not.toMatch(MASCOT_ROW);
+  });
 });

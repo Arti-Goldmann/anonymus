@@ -1,9 +1,9 @@
 import chalk from "chalk";
 
 /**
- * The anonymus mascot: an orange space invader wearing a Guy Fawkes mask.
- * Resampled from the original artwork (palette taken from the image itself),
- * then hand-polished and mirrored so the mask is exactly symmetric.
+ * The anonymus mascot: an orange space invader wearing a Guy Fawkes mask,
+ * drawn small — exactly as tall as the info lines next to it in the header
+ * (14 pixel rows = 7 terminal rows) — and mirror-symmetric.
  * One character per pixel; two pixel rows are packed into one terminal row
  * with the half-block glyphs ▀ / ▄ (foreground = one pixel, background = the
  * other), so the sprite keeps square-ish proportions.
@@ -13,40 +13,20 @@ import chalk from "chalk";
  *   K  outline / features
  */
 export const MASCOT_SPRITE: readonly string[] = [
-  ".......OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO.......",
-  ".......OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO.......",
-  ".......OOOOOOKKKKKKKKKKKKKKKKKKKKOOOOOO.......",
-  ".......OOOOOKLLWWWWWWWWWWWWWWWWLLKOOOOO.......",
-  ".......OOOOOKLWWWWWWWWWWWWWWWWWWLKOOOOO.......",
-  ".......OOOOKLKKKKKKLWWWWWWLKKKKKKLKOOOO.......",
-  ".......OOODKGLLWWWKKKWWWWKKKWWWLLGKDOOO.......",
-  ".......OOODKLWWWWWWWKKWWKKWWWWWWWLKDOOO.......",
-  ".......OOODKWWWKKKKWLLWWLLWKKKKWWWKDOOO.......",
-  ".......OOODKWWKKKKKKLLWWLLKKKKKKWWKDOOO.......",
-  ".......OOODKLWWWWWWWLLWWLLWWWWWWWLKDOOO.......",
-  ".......OOODKLWWWWWWWWWWWWWWWWWWWWLKDOOO.......",
-  ".......OOODKLWWWWWWWWWWWWWWWWWWWWLKDOOO.......",
-  ".......OOODKGLWWWWWLLWWWWLLWWWWWLGKDOOO.......",
-  ".......OOODKLWWWLLLLWWWWWWLLLLWWWLKDOOO.......",
-  ".......OOODKLWWKWWWWLKKKKLWWWWKWWLKDOOO.......",
-  "OOOOOOOOOOODKWWKKWWKKKKKKKKWWKKWWKDOOOOOOOOOOO",
-  "OOOOOOOOOOODKWWWKKKKKKWWKKKKKKWWWKDOOOOOOOOOOO",
-  "OOOOOOOOOOOOKLLWWWWWWWWWWWWWWWWLLKOOOOOOOOOOOO",
-  "OOOOOOOOOOOODKLWWWWLKKKKKKLWWWWLKDOOOOOOOOOOOO",
-  "OOOOOOOOOOOOODKLWWWWWWKKWWWWWWLKDOOOOOOOOOOOOO",
-  ".......OOOOOOODKLWWWWWKKWWWWWLKDOOOOOOO.......",
-  ".......OOOOOOOODKLWWWWKKWWWWLKDOOOOOOOO.......",
-  ".......OOOOOOOOODKLWWWKKWWWLKDOOOOOOOOO.......",
-  ".......OOOOOOOOOODKLWWKKWWLKDOOOOOOOOOO.......",
-  ".......OOOOOOOOOOODKLWKKWLKDOOOOOOOOOOO.......",
-  ".......OOOOOOOOOOOODKKKKKKDOOOOOOOOOOOO.......",
-  ".......OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO.......",
-  "..........OOO..OOO..........OOO..OOO..........",
-  "..........OOO..OOO..........OOO..OOO..........",
-  "..........OOO..OOO..........OOO..OOO..........",
-  "..........OOO..OOO..........OOO..OOO..........",
-  "..........OOO..OOO..........OOO..OOO..........",
-  "..........DDD..DDD..........DDD..DDD..........",
+  "...OOOOOOOOOOOOOO...",
+  "...OOKKKKKKKKKKOO...",
+  "...OKWWWWWWWWWWKO...",
+  "...OKWKKKWWKKKWKO...",
+  "...OKWWKKWWKKWWKO...",
+  "...OKLWWWLLWWWLKO...",
+  "OOOOKWKWWWWWWKWKOOOO",
+  "OOOOKWWKKKKKKWWKOOOO",
+  "OOOODKWWWKKWWWKDOOOO",
+  "...OODKWWKKWWKDOO...",
+  "...OOODKWKKWKDOOO...",
+  "...OOOODKKKKDOOOO...",
+  "....O.O......O.O....",
+  "....D.D......D.D....",
 ];
 
 const PALETTE: Record<string, string> = {

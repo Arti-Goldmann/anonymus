@@ -27,9 +27,6 @@ type Screen =
   | { kind: "problem"; pair: string }
   | { kind: "stopping" };
 
-/** Live-sync events that mean a file actually moved; the first one folds the mascot. */
-const TRANSFER_KINDS = new Set<SyncEvent["kind"]>(["to-sandbox", "to-project", "deleted", "merged", "resolved"]);
-
 /** Events kept in memory for the on-screen log (the journal file has all). */
 const MAX_EVENTS = 500;
 
@@ -88,8 +85,6 @@ export function App({
     warnings.map((w) => ({ time: now(), kind: "warning" as const, message: w }))
   );
   const [fatal, setFatal] = useState<string | null>(null);
-  // The mascot stays until the first file moves.
-  const [folded, setFolded] = useState(false);
   const journal = useMemo(() => path.join(workspace.config.projectRoot, SERVICE_DIR, "anonymus.log"), [workspace]);
 
   const update = useCallback((name: string, patch: Partial<PairView>) => {
@@ -110,9 +105,6 @@ export function App({
   const pushEvent = useCallback(
     (ev: SyncEvent) => {
       setEvents((prev) => [...prev.slice(-(MAX_EVENTS - 1)), ev]);
-      if (TRANSFER_KINDS.has(ev.kind)) {
-        setFolded(true);
-      }
       if (ev.pair && (ev.kind === "to-sandbox" || ev.kind === "to-project" || ev.kind === "deleted")) {
         setPairs((prev) =>
           prev.map((p) =>
@@ -501,8 +493,9 @@ export function App({
   // One row is left free: a frame as tall as the window would scroll it.
   const frameRows = Math.max(5, rows - 1);
   const bodyMin = screen.kind === "reconcile" ? RECONCILE_COMPACT_ROWS : 10;
-  const showMascot = screen.kind === "overview" && !folded;
-  const fullHeader = showMascot && columns >= HEADER_MIN_COLUMNS && frameRows >= HEADER_ROWS + bodyMin;
+  // The mascot header stays as long as the window has room for it; a small
+  // window gets the one-line header instead.
+  const fullHeader = columns >= HEADER_MIN_COLUMNS && frameRows >= HEADER_ROWS + bodyMin;
   const bodyRows = frameRows - (fullHeader ? HEADER_ROWS : 1);
   const current = screen.kind !== "overview" && screen.kind !== "stopping" ? pairs.find((p) => p.name === screen.pair) : undefined;
   const maxItems = Math.max(1, Math.min(Math.max(pairs.length, 1), Math.floor(bodyRows / 3)));
