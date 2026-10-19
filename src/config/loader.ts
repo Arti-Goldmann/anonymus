@@ -198,8 +198,12 @@ export function loadConfig(configPath: string): LoadResult {
   }
 
   let sandboxRoot = "";
-  if (typeof raw.sandbox !== "string" || raw.sandbox.trim() === "") {
-    problems.push("sandbox: укажите путь к папке песочницы (относительно проекта или абсолютный).");
+  if (raw.sandbox === undefined && typeof raw.sandboxes_dir === "string") {
+    // Git projects may set only sandboxes_dir: every sandbox is a sub-sandbox there.
+  } else if (typeof raw.sandbox !== "string" || raw.sandbox.trim() === "") {
+    problems.push(
+      "sandbox: укажите путь к папке песочницы (относительно проекта или абсолютный) или sandboxes_dir."
+    );
   } else {
     sandboxRoot = path.resolve(projectRoot, raw.sandbox.trim());
     if (isInside(sandboxRoot, projectRoot) || isInside(projectRoot, sandboxRoot)) {
@@ -224,6 +228,32 @@ export function loadConfig(configPath: string): LoadResult {
     }
   }
 
+  // Git worktrees of the sub-sandboxes: next to the project, never inside it
+  // (builds and searches in the project would see every file several times).
+  let worktreesDir = path.join(path.dirname(projectRoot), `${path.basename(projectRoot)}.worktrees`);
+  if (raw.worktrees_dir !== undefined) {
+    if (typeof raw.worktrees_dir !== "string" || raw.worktrees_dir.trim() === "") {
+      problems.push("worktrees_dir: ожидается путь к папке.");
+    } else {
+      worktreesDir = path.resolve(projectRoot, raw.worktrees_dir.trim());
+    }
+  }
+  if (isInside(worktreesDir, projectRoot) || isInside(projectRoot, worktreesDir)) {
+    problems.push(`worktrees_dir: папка worktree (${worktreesDir}) не может лежать внутри проекта или содержать его.`);
+  }
+  // Sandboxes must never end up inside the worktrees (or a worktree inside a
+  // sandbox). Worktrees next to the sandboxes in one parent folder are fine.
+  const clash = (label: string, dir: string, both: boolean) => {
+    if (dir && (isInside(dir, worktreesDir) || (both && isInside(worktreesDir, dir)))) {
+      problems.push(
+        `${label}: ${dir} и папка worktree ${worktreesDir} не могут лежать одна в другой — ` +
+          "песочницы и рабочие копии проекта должны быть раздельно."
+      );
+    }
+  };
+  clash("sandboxes_dir", sandboxesDir, false);
+  clash("sandbox", sandboxRoot, true);
+
   const sync = parseSync(raw, problems, warnings);
   const replacements = parseReplacements(raw, problems, warnings);
 
@@ -237,6 +267,7 @@ export function loadConfig(configPath: string): LoadResult {
       configPath: path.resolve(configPath),
       profile: { name: "default", sandboxRoot },
       sandboxesDir,
+      worktreesDir,
       sync,
       replacements,
     },

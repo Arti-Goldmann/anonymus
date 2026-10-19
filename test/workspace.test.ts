@@ -1,199 +1,146 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyReconcile, planReconcile } from "../src/core/reconcile.js";
-import { scan } from "../src/core/scanner.js";
-import { Workspace } from "../src/core/workspace.js";
+import iconv from "iconv-lite";
 import { acquireLock } from "../src/core/lock.js";
+import { RegistryFormatError } from "../src/core/registry.js";
+import { Workspace } from "../src/core/workspace.js";
 import { makeBench, type Bench } from "./helpers.js";
+import { livePair, reconcilePair, waitFor } from "./pairs.js";
 
-/** Fill the active sub-sandbox from the project (what the UI does on an empty sandbox). */
-async function fill(ws: Workspace): Promise<void> {
-  const engine = ws.engineFor();
-  await applyReconcile(engine, planReconcile(await scan(engine), "project-wins"));
-}
-
-describe("Workspace: sub-sandboxes per branch", () => {
+describe("Workspace: a git worktree per sub-sandbox", () => {
   let bench: Bench;
-  afterEach(() => bench?.cleanup());
+  const stops: (() => Promise<void>)[] = [];
+  afterEach(async () => {
+    await Promise.all(stops.splice(0).map((s) => s()));
+    bench?.cleanup();
+  });
 
   function setup(): Workspace {
     bench = makeBench();
     bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
-    bench.write("project", "anonymus.yaml", "# config with real names, not in .gitignore on purpose\n");
+    bench.writeWin1251("project", "BIGcorpProject/ru.c", "// Комментарий BIGcorpProject\r\nint x;\r\n");
+    bench.write("project", ".gitignore", "anonymus.yaml\n.anonymus/\n");
     bench.gitInit();
-    const ws = new Workspace(bench.config());
-    ws.reconcileWithGit();
-    return ws;
+    return new Workspace(bench.config());
   }
 
-  it("seeds the registry from `sandbox:` with the current branch", () => {
+  it("starts without pairs; the main folder is never synced", () => {
     const ws = setup();
     expect(ws.gitEnabled).toBe(true);
-    expect(ws.registry.list().map((s) => [s.name, s.branch])).toEqual([["default", "master"]]);
-    expect(ws.registry.absPath(ws.active)).toBe(bench.sandbox);
-    expect(fs.existsSync(path.join(bench.project, ".anonymus", "sandboxes.json"))).toBe(true);
+    expect(ws.pairs()).toEqual([]);
+    expect(ws.problems()).toEqual([]);
   });
 
-  it("creates a branch from HEAD and an anonymized folder, then switches to it", async () => {
+  it("creates a branch, its worktree with the ownership mark and an anonymized sandbox folder", async () => {
     const ws = setup();
-    await fill(ws);
-    const { entry } = ws.create("BIGcorpProject-uart");
+    const entry = ws.create("BIGcorpProject-uart");
 
-    expect(bench.git("branch", "--show-current")).toBe("BIGcorpProject-uart");
+    expect(bench.git("branch", "--show-current")).toBe("master"); // main folder untouched
     expect(entry.branch).toBe("BIGcorpProject-uart");
+    expect(entry.base).toEqual({ branch: "master", commit: bench.git("rev-parse", "master") });
+    expect(entry.worktree).toBe(path.join(bench.root, "proj.worktrees", "BIGcorpProject-uart"));
+    expect(bench.gitIn(entry.worktree, "branch", "--show-current")).toBe("BIGcorpProject-uart");
     // The folder the agent sees carries the placeholder, not the real name.
-    expect(path.basename(ws.registry.absPath(entry))).toBe("MyProject-uart");
-    expect(ws.active.name).toBe("BIGcorpProject-uart");
+    expect(path.basename(entry.sandbox)).toBe("MyProject-uart");
+    expect(ws.check(entry.name, false)).toBeNull();
 
-    await fill(ws);
-    expect(fs.readFileSync(path.join(ws.registry.absPath(entry), "MyProject", "main.c"), "utf8")).toBe(
-      "int v = 1; // MyProject\n"
+    await reconcilePair(ws, entry.name);
+    expect(fs.readFileSync(path.join(entry.sandbox, "MyProject", "main.c"), "utf8")).toBe("int v = 1; // MyProject\n");
+    expect(iconv.decode(fs.readFileSync(path.join(entry.sandbox, "MyProject", "ru.c")), "win1251")).toBe(
+      "// Комментарий MyProject\r\nint x;\r\n"
     );
+    // The worktree's `.git` is a file: it must never reach the sandbox.
+    expect(fs.statSync(path.join(entry.worktree, ".git")).isFile()).toBe(true);
+    expect(fs.existsSync(path.join(entry.sandbox, ".git"))).toBe(false);
+  });
+
+  it("takes an existing branch that is not checked out anywhere", () => {
+    const ws = setup();
+    bench.git("branch", "old-feature");
+    expect(ws.isExistingBranch("old-feature")).toBe(true);
+    const entry = ws.create("old-feature");
+    expect(entry.base).toBeNull();
+    expect(bench.gitIn(entry.worktree, "branch", "--show-current")).toBe("old-feature");
+    // master is checked out in the main folder: git cannot give it to a worktree.
+    expect(ws.validateNewName("master")).toMatch(/уже выбрана/);
   });
 
   it("rejects bad or duplicate names", () => {
     const ws = setup();
+    ws.create("feature");
     expect(ws.validateNewName("bad name with ..")).toMatch(/не подходит/);
-    expect(ws.validateNewName("master")).toMatch(/уже существует/);
+    expect(ws.validateNewName("feature")).toMatch(/уже есть/);
     expect(ws.validateNewName("ok-name")).toBeNull();
   });
 
-  it("stashes uncommitted work per branch and brings it back on return", async () => {
+  it("syncs several pairs at the same time, each with its own worktree", async () => {
     const ws = setup();
-    await fill(ws);
-    ws.create("feature");
-    await fill(ws);
+    const a = ws.create("agent-a");
+    const b = ws.create("agent-b");
+    const pa = await livePair(ws, "agent-a");
+    const pb = await livePair(ws, "agent-b");
+    stops.push(() => pa.syncer.stop(), () => pb.syncer.stop());
 
-    // Work on `feature` (as synced from its sub-sandbox), uncommitted.
-    bench.write("project", "BIGcorpProject/main.c", "int v = 2; // BIGcorpProject\n");
-    bench.write("project", "BIGcorpProject/new.c", "// new on feature\n");
-
-    ws.switchTo("default");
-    expect(bench.git("branch", "--show-current")).toBe("master");
+    fs.writeFileSync(path.join(a.sandbox, "MyProject", "main.c"), "int v = 2; // MyProject\n");
+    fs.writeFileSync(path.join(b.sandbox, "MyProject", "new.c"), "// MyProject b\n");
+    await waitFor(() => fs.existsSync(path.join(b.worktree, "BIGcorpProject", "new.c")));
+    await waitFor(
+      () => fs.readFileSync(path.join(a.worktree, "BIGcorpProject", "main.c"), "utf8") === "int v = 2; // BIGcorpProject\n"
+    );
+    // Independent: nothing crossed over, the main folder stayed as it was.
+    expect(fs.readFileSync(path.join(b.worktree, "BIGcorpProject", "main.c"), "utf8")).toBe("int v = 1; // BIGcorpProject\n");
+    expect(fs.existsSync(path.join(a.worktree, "BIGcorpProject", "new.c"))).toBe(false);
     expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 1; // BIGcorpProject\n");
-    expect(bench.exists("project", "BIGcorpProject/new.c")).toBe(false);
-    expect(ws.registry.get("feature")!.stash).toMatch(/^anonymus:feature:/);
-    // anonymus' own files never travel with the stash.
-    expect(bench.exists("project", "anonymus.yaml")).toBe(true);
-    expect(bench.exists("project", ".anonymus/sandboxes.json")).toBe(true);
-
-    const warnings = ws.switchTo("feature");
-    expect(warnings).toEqual([]);
-    expect(bench.git("branch", "--show-current")).toBe("feature");
-    expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 2; // BIGcorpProject\n");
-    expect(bench.read("project", "BIGcorpProject/new.c")).toBe("// new on feature\n");
-    expect(ws.registry.get("feature")!.stash).toBeNull();
+    expect(bench.git("status", "--porcelain")).toBe("");
   });
 
-  it("switches when anonymus' own files are in .gitignore (as `anonymus init` sets it up)", async () => {
-    bench = makeBench();
-    bench.write("project", "BIGcorpProject/main.c", "int v = 1;\n");
-    bench.write("project", ".gitignore", "anonymus.yaml\n.anonymus/\n");
-    bench.write("project", "anonymus.yaml", "# real names\n");
-    bench.gitInit();
-    const ws = new Workspace(bench.config());
-    ws.reconcileWithGit();
-    ws.create("feature");
-    bench.write("project", "BIGcorpProject/main.c", "int v = 2;\n");
-    bench.write("project", "BIGcorpProject/new.c", "// new\n");
-
-    ws.switchTo("default");
-    expect(bench.git("branch", "--show-current")).toBe("master");
-    expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 1;\n");
-    expect(bench.exists("project", "anonymus.yaml")).toBe(true);
-    expect(bench.git("stash", "list").split("\n").filter(Boolean)).toHaveLength(1);
-
-    ws.switchTo("feature");
-    expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 2;\n");
-    expect(bench.read("project", "BIGcorpProject/new.c")).toBe("// new\n");
-    expect(bench.git("stash", "list")).toBe("");
-
-    // Committing also works with ignored own files.
-    expect(ws.commitActive("feature work")).toBe(true);
-    expect(bench.git("show", "--name-only", "--format=", "HEAD").split("\n").sort()).toEqual([
-      "BIGcorpProject/main.c",
-      "BIGcorpProject/new.c",
-    ]);
-  });
-
-  it("picks the sub-sandbox of a branch that was checked out by hand", () => {
+  it("commits a pair's work in its worktree, without anonymus' own files", async () => {
     const ws = setup();
-    ws.create("feature");
-    bench.git("checkout", "--quiet", "master");
-    const again = new Workspace(bench.config());
-    const notices = again.reconcileWithGit();
-    expect(again.active.name).toBe("default");
-    expect(notices[0].message).toMatch(/ветка master/);
-    expect(again.branchMismatch).toBe(false);
+    const e = ws.create("feature");
+    fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "main.c"), "int v = 2;\n");
+    expect(ws.commit("feature", "work")).toBe(true);
+    expect(bench.git("log", "-1", "--format=%s", "feature")).toBe("work");
+    expect(ws.commit("feature", "again")).toBe(false);
   });
 
-  it("reports a branch checked out by hand that has no sub-sandbox, and adopts it", () => {
+  it("removes a pair: sandbox to the trash, worktree via git, branch kept", async () => {
     const ws = setup();
-    expect(ws.branchProblem()).toBeNull();
-    bench.git("checkout", "--quiet", "-b", "BIGcorpProject-loose");
-    expect(ws.branchProblem()).toEqual({ expected: "master", actual: "BIGcorpProject-loose", target: null });
-    expect(ws.validateAdopt("BIGcorpProject-loose")).toBeNull();
-
-    ws.adoptCurrentBranch();
-    expect(ws.active.name).toBe("BIGcorpProject-loose");
-    expect(ws.active.branch).toBe("BIGcorpProject-loose");
-    // A new folder with the placeholder name; no new branch was made.
-    expect(path.basename(ws.registry.absPath(ws.active))).toBe("MyProject-loose");
-    expect(fs.existsSync(ws.registry.absPath(ws.active))).toBe(true);
-    expect(bench.git("branch", "--show-current")).toBe("BIGcorpProject-loose");
-    expect(ws.branchProblem()).toBeNull();
-    expect(ws.validateAdopt("BIGcorpProject-loose")).toMatch(/уже есть/);
-
-    // And back: the problem names the sub-sandbox of the branch checked out.
-    bench.git("checkout", "--quiet", "master");
-    expect(ws.branchProblem()).toEqual({ expected: "BIGcorpProject-loose", actual: "master", target: "default" });
-    ws.checkoutActiveBranch();
-    expect(bench.git("branch", "--show-current")).toBe("BIGcorpProject-loose");
-    expect(ws.branchProblem()).toBeNull();
-  });
-
-  it("removes a sub-sandbox to the trash and keeps the branch", async () => {
-    const ws = setup();
-    ws.create("feature");
-    await fill(ws);
-    const folder = ws.registry.absPath(ws.registry.get("feature")!);
-    expect(() => ws.remove("feature")).toThrow(/активную/);
-
-    ws.switchTo("default");
+    const e = ws.create("feature");
+    await reconcilePair(ws, "feature");
     const { trashDir } = ws.remove("feature");
-    expect(fs.existsSync(folder)).toBe(false);
-    expect(fs.existsSync(path.join(trashDir, path.basename(folder), "MyProject", "main.c"))).toBe(true);
-    expect(ws.registry.get("feature")).toBeUndefined();
+    expect(fs.existsSync(e.worktree)).toBe(false);
+    expect(fs.existsSync(e.sandbox)).toBe(false);
+    expect(fs.existsSync(path.join(trashDir, path.basename(e.sandbox), "MyProject", "main.c"))).toBe(true);
+    expect(ws.pairs()).toEqual([]);
     expect(bench.git("branch", "--list", "feature")).toContain("feature");
+    expect(bench.git("worktree", "list").split("\n")).toHaveLength(1);
   });
 
-  it("removes a sub-sandbox together with its branch's stash, or keeps the stash on request", () => {
+  it("refuses to remove a worktree with uncommitted work unless forced, then keeps a copy", () => {
     const ws = setup();
-    ws.create("keep");
-    bench.write("project", "BIGcorpProject/main.c", "int v = 2; // keep\n");
-    ws.create("drop"); // switching away from `keep` stashes its work
-    bench.write("project", "BIGcorpProject/main.c", "int v = 3; // drop\n");
-    ws.switchTo("default"); // ...and `drop`'s work too
-    expect(ws.hasStash("keep")).toBe(true);
-    expect(ws.hasStash("drop")).toBe(true);
-    expect(bench.git("stash", "list").split("\n")).toHaveLength(2);
+    const e = ws.create("feature");
+    fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "main.c"), "int v = 9;\n");
+    fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "new.c"), "// new\n");
+    expect(ws.uncommitted("feature")).toHaveLength(2);
+    expect(() => ws.remove("feature")).toThrow(/незакоммиченные изменения/);
+    expect(fs.existsSync(e.worktree)).toBe(true);
 
-    const kept = ws.remove("keep");
-    expect(kept.stashDropped).toBe(false);
-    expect(kept.warnings[0]).toMatch(/остался stash/);
-
-    const dropped = ws.remove("drop", () => {}, { dropStash: true });
-    expect(dropped.stashDropped).toBe(true);
-    expect(dropped.warnings).toEqual([]);
-
-    const remaining = bench.git("stash", "list");
-    expect(remaining).toContain("anonymus:keep:");
-    expect(remaining).not.toContain("anonymus:drop:");
-    expect(bench.git("branch", "--list", "drop")).toContain("drop"); // the branch itself stays
+    const { trashDir } = ws.remove("feature", { force: true });
+    expect(fs.readFileSync(path.join(trashDir, "worktree", "BIGcorpProject", "main.c"), "utf8")).toBe("int v = 9;\n");
+    expect(fs.readFileSync(path.join(trashDir, "worktree", "BIGcorpProject", "new.c"), "utf8")).toBe("// new\n");
+    expect(fs.existsSync(e.worktree)).toBe(false);
   });
 
-  it("allows only one running instance per project, whatever the profile", () => {
+  it("refuses the old stash-based registry with a clear message", () => {
+    bench = makeBench();
+    bench.write("project", "a.txt", "a\n");
+    bench.gitInit();
+    bench.write("project", ".anonymus/sandboxes.json", JSON.stringify({ version: 1, active: "default", sandboxes: [{}] }));
+    expect(() => new Workspace(bench.config())).toThrow(RegistryFormatError);
+  });
+
+  it("allows only one running instance per project", () => {
     bench = makeBench();
     const dir = path.join(bench.project, ".anonymus");
     const first = acquireLock(dir);
@@ -208,12 +155,14 @@ describe("Workspace without git", () => {
   let bench: Bench;
   afterEach(() => bench?.cleanup());
 
-  it("keeps working with the single default sandbox", () => {
+  it("keeps working with the single pair: project folder ⇄ sandbox", async () => {
     bench = makeBench();
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
     const ws = new Workspace(bench.config());
-    ws.reconcileWithGit();
     expect(ws.gitEnabled).toBe(false);
-    expect(ws.active.name).toBe("default");
+    expect(ws.pairs().map((p) => [p.name, p.projectDir])).toEqual([["default", bench.project]]);
     expect(ws.validateNewName("x")).toMatch(/не является git/);
+    await reconcilePair(ws, "default");
+    expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n");
   });
 });

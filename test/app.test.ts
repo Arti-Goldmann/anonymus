@@ -39,166 +39,13 @@ ${(globalThis as { __screen?: () => string }).__screen?.() ?? ""}`);
 
 const MASCOT_ROW = /▀{20,}/; // a full mascot row is a long run of half blocks
 
-describe("App: sub-sandbox workflow end to end", () => {
+describe("App: pairs of sub-sandbox ⇄ worktree", () => {
   let bench: Bench;
   let unmount: (() => void) | null = null;
   afterEach(async () => {
     unmount?.();
     unmount = null;
-    await new Promise((r) => setTimeout(r, 200)); // let watchers close
-    bench?.cleanup();
-  });
-
-  it("folds the mascot, creates a sub-sandbox for a new branch and switches back", async () => {
-    bench = makeBench();
-    bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
-    bench.gitInit();
-
-    const out = new FakeStdout();
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
-    const ws = new Workspace(bench.config());
-    const app = render(React.createElement(App, { workspace: ws, version: "test", warnings: [] }), {
-      stdout: out as never,
-      stdin: stdin as never,
-      patchConsole: false,
-      exitOnCtrlC: false,
-    });
-    unmount = () => app.unmount();
-    const press = (keys: string) => stdin.write(keys);
-    (globalThis as { __screen?: () => string }).__screen = () => out.screen;
-
-    // Empty sandbox is filled automatically; live sync starts with the mascot.
-    await until(() => out.screen.includes("синхронизация активна"), "live sync");
-    expect(out.screen).toMatch(MASCOT_ROW);
-    expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n");
-
-    // The first file that moves folds the mascot into the one-line header.
-    bench.write("project", "BIGcorpProject/readme.txt", "notes\n");
-    await until(() => bench.read("sandbox", "MyProject/readme.txt") === "notes\n", "first transfer");
-    await until(() => !MASCOT_ROW.test(out.screen), "mascot folded");
-    expect(out.screen).toContain("default ⎇ master");
-
-    // b → n → name → Enter: new branch + sub-sandbox, synced right away.
-    press("b");
-    await until(() => out.screen.includes("Подпесочницы"), "sandboxes screen");
-    press("n");
-    await until(() => out.screen.includes("Имя новой ветки"), "name input");
-    press("feature-x");
-    await until(() => out.screen.includes("папка"), "preview of the new folder");
-    press("\r");
-    await until(() => out.screen.includes("создать и переключиться"), "create: switch or not");
-    press("\r");
-    await until(
-      () => out.screen.includes("feature-x ⎇ feature-x") && out.screen.includes("синхронизация активна"),
-      "switched to feature-x"
-    );
-    expect(bench.git("branch", "--show-current")).toBe("feature-x");
-    const folder = path.join(path.dirname(bench.sandbox), "feature-x");
-    expect(fs.readFileSync(path.join(folder, "MyProject", "main.c"), "utf8")).toBe("int v = 1; // MyProject\n");
-
-    // An edit in the new sub-sandbox reaches the project (on branch feature-x).
-    fs.writeFileSync(path.join(folder, "MyProject", "main.c"), "int v = 2; // MyProject\n");
-    await until(() => bench.read("project", "BIGcorpProject/main.c") === "int v = 2; // BIGcorpProject\n", "sync to project");
-
-    // Back to default: the edit is stashed with feature-x, master is clean.
-    press("b");
-    await until(() => out.screen.includes("Подпесочницы"), "sandboxes screen again");
-    press("\x1b[A"); // up: default is listed first
-    await until(() => out.screen.includes("❯ ○ default"), "default selected");
-    press("\r");
-    await until(
-      () => out.screen.includes("default ⎇ master") && out.screen.includes("синхронизация активна"),
-      "switched back to default"
-    );
-    expect(bench.git("branch", "--show-current")).toBe("master");
-    expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 1; // BIGcorpProject\n");
-    expect(ws.registry.get("feature-x")!.stash).toMatch(/^anonymus:feature-x:/);
-
-    // b → n → name → Enter → s: a sub-sandbox off master, the project stays put.
-    press("b");
-    await until(() => out.screen.includes("Подпесочницы"), "sandboxes screen, third time");
-    press("n");
-    await until(() => out.screen.includes("Имя новой ветки"), "name input again");
-    press("agent-y");
-    await until(() => out.screen.includes("agent-y"), "typed name");
-    press("\r");
-    await until(() => out.screen.includes("создать, не переключаясь"), "create choice");
-    press("s");
-    await until(() => out.screen.includes("«agent-y» создана от master"), "created without switching");
-    expect(bench.git("branch", "--show-current")).toBe("master");
-    expect(fs.readFileSync(path.join(path.dirname(bench.sandbox), "agent-y", "MyProject", "main.c"), "utf8")).toBe(
-      "int v = 1; // MyProject\n"
-    );
-  }, 60000);
-});
-
-describe("App: branch switched outside anonymus", () => {
-  let bench: Bench;
-  let unmount: (() => void) | null = null;
-  afterEach(async () => {
-    unmount?.();
-    unmount = null;
-    await new Promise((r) => setTimeout(r, 200)); // let watchers close
-    bench?.cleanup();
-  });
-
-  it("stops sync, then switches to that branch's sub-sandbox or checks the branch out back", async () => {
-    bench = makeBench();
-    bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
-    bench.gitInit();
-    const ws = new Workspace(bench.config());
-    ws.reconcileWithGit();
-    ws.create("feature", { switchTo: false });
-    bench.git("checkout", "--quiet", "-b", "loose"); // a branch without a sub-sandbox
-    bench.git("checkout", "--quiet", "master");
-
-    const out = new FakeStdout();
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
-    const app = render(React.createElement(App, { workspace: ws, version: "test", warnings: [] }), {
-      stdout: out as never,
-      stdin: stdin as never,
-      patchConsole: false,
-      exitOnCtrlC: false,
-    });
-    unmount = () => app.unmount();
-    const press = (keys: string) => stdin.write(keys);
-    (globalThis as { __screen?: () => string }).__screen = () => out.screen;
-    await until(() => out.screen.includes("синхронизация активна"), "live sync");
-
-    // s: adopt the sub-sandbox of the branch checked out by hand.
-    bench.git("checkout", "--quiet", "feature");
-    await until(() => out.screen.includes("ветка сменилась вне anonymus: master → feature"), "branch-change frame");
-    expect(out.screen).toContain("s подпесочница «feature»");
-    press("s");
-    await until(
-      () => out.screen.includes("feature ⎇ feature") && out.screen.includes("синхронизация активна"),
-      "switched to feature"
-    );
-    expect(ws.active.name).toBe("feature");
-
-    // x: no sub-sandbox for `loose` — put feature back.
-    bench.git("checkout", "--quiet", "loose");
-    await until(() => out.screen.includes("ветка сменилась вне anonymus: feature → loose"), "second frame");
-    expect(out.screen).toContain("у loose нет подпесочницы");
-    press("s"); // not offered: nothing happens
-    await new Promise((r) => setTimeout(r, 300));
-    press("x");
-    await until(
-      () => out.screen.includes("feature ⎇ feature") && out.screen.includes("синхронизация активна"),
-      "feature checked out back"
-    );
-    expect(bench.git("branch", "--show-current")).toBe("feature");
-    expect(ws.active.name).toBe("feature");
-  }, 60000);
-});
-
-describe("App: start-up on a branch the active sub-sandbox is not tied to", () => {
-  let bench: Bench;
-  let unmount: (() => void) | null = null;
-  afterEach(async () => {
-    unmount?.();
-    unmount = null;
-    await new Promise((r) => setTimeout(r, 200)); // let watchers close
+    await new Promise((r) => setTimeout(r, 300)); // let watchers close
     bench?.cleanup();
   });
 
@@ -216,40 +63,53 @@ describe("App: start-up on a branch the active sub-sandbox is not tied to", () =
     return { out, press: (keys: string) => stdin.write(keys) };
   }
 
-  it("asks before scanning: x checks the branch out back, a gives the branch its own sub-sandbox", async () => {
+  it("creates a pair, syncs it, stops it when its worktree is removed and recovers it", async () => {
     bench = makeBench();
     bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
+    bench.write("project", ".gitignore", "anonymus.yaml\n.anonymus/\n");
     bench.gitInit();
     const ws = new Workspace(bench.config());
-    ws.reconcileWithGit(); // default ⎇ master is saved
-    bench.git("checkout", "--quiet", "-b", "loose");
-    bench.write("project", "BIGcorpProject/main.c", "int v = 2; // BIGcorpProject\n");
-    bench.git("commit", "--quiet", "-am", "loose");
+    const { out, press } = startApp(ws);
 
-    // x: back to master; only then the (empty) default sandbox is filled.
-    let { out, press } = startApp(ws);
-    await until(() => out.screen.includes("в проекте ветка loose, а подпесочница «default» привязана к master"), "branch screen");
-    expect(out.screen).toContain("a  новая подпесочница для ветки loose");
-    await new Promise((r) => setTimeout(r, 300));
-    expect(bench.exists("sandbox", "MyProject/main.c")).toBe(false); // nothing scanned or copied
-    press("x");
-    await until(() => out.screen.includes("синхронизация активна"), "live on master");
-    expect(bench.git("branch", "--show-current")).toBe("master");
-    expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n");
-    unmount!();
-    await new Promise((r) => setTimeout(r, 200));
+    await until(() => out.screen.includes("Подпесочниц пока нет"), "empty list");
+    expect(out.screen).toMatch(MASCOT_ROW);
 
-    // a: a new sub-sandbox for the branch checked out by hand.
-    bench.git("checkout", "--quiet", "loose");
-    ({ out, press } = startApp(new Workspace(bench.config())));
-    await until(() => out.screen.includes("в проекте ветка loose"), "branch screen again");
-    press("a");
-    await until(
-      () => out.screen.includes("loose ⎇ loose") && out.screen.includes("синхронизация активна"),
-      "live on the new sub-sandbox"
-    );
-    const folder = path.join(path.dirname(bench.sandbox), "loose");
-    expect(fs.readFileSync(path.join(folder, "MyProject", "main.c"), "utf8")).toBe("int v = 2; // MyProject\n");
-    expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n"); // default untouched
+    // n → name → Enter: branch + worktree + sandbox, filled and synced right away.
+    press("n");
+    await until(() => out.screen.includes("Имя новой подпесочницы"), "name input");
+    press("feature-x");
+    await until(() => /sandboxes[\\/]feature-x/.test(out.screen), "preview of the folders");
+    press("\r");
+    await until(() => out.screen.includes("feature-x") && out.screen.includes("синхронно"), "pair live");
+    const entry = ws.pair("feature-x");
+    const sandboxMain = path.join(entry.sandboxDir, "MyProject", "main.c");
+    expect(fs.readFileSync(sandboxMain, "utf8")).toBe("int v = 1; // MyProject\n");
+    expect(bench.git("branch", "--show-current")).toBe("master"); // the main folder is never touched
+
+    // An agent edit reaches the worktree; the first transfer folds the mascot.
+    fs.writeFileSync(sandboxMain, "int v = 2; // MyProject\n");
+    const worktreeMain = path.join(entry.projectDir, "BIGcorpProject", "main.c");
+    await until(() => fs.readFileSync(worktreeMain, "utf8") === "int v = 2; // BIGcorpProject\n", "sync to worktree");
+    await until(() => !MASCOT_ROW.test(out.screen), "mascot folded");
+
+    // The worktree is removed with git behind anonymus' back: the pair stops, the sandbox is intact.
+    bench.git("worktree", "remove", "--force", entry.projectDir);
+    await until(() => out.screen.includes("остановлена: worktree удалён"), "pair stopped");
+    await new Promise((r) => setTimeout(r, 500));
+    expect(fs.readFileSync(sandboxMain, "utf8")).toBe("int v = 2; // MyProject\n");
+
+    // Enter → problem screen → w → y: worktree re-created, review recommends sandbox → project.
+    press("\r");
+    await until(() => out.screen.includes("«feature-x» остановлена"), "problem screen");
+    press("w");
+    await until(() => out.screen.includes("Создать worktree заново"), "confirm recreate");
+    press("y");
+    await until(() => out.screen.includes("создан заново"), "review with a note");
+    expect(out.screen).toMatch(/Песочница → проект \(рекомендуется\)/);
+    press("\r");
+    await until(() => out.screen.includes("что будет сделано"), "plan");
+    press("\r");
+    await until(() => out.screen.includes("синхронно"), "live again");
+    expect(fs.readFileSync(worktreeMain, "utf8")).toBe("int v = 2; // BIGcorpProject\n");
   }, 60000);
 });

@@ -22,6 +22,8 @@ export interface Bench {
   /** Make the project a git repo with one commit of everything in it. */
   gitInit(): void;
   git(...args: string[]): string;
+  /** git in another folder (a worktree). */
+  gitIn(dir: string, ...args: string[]): string;
   cleanup(): void;
 }
 
@@ -70,7 +72,8 @@ export function makeBench(): Bench {
         projectRoot: project,
         configPath: path.join(project, "anonymus.yaml"),
         profile: { name: "default", sandboxRoot: sandbox },
-        sandboxesDir: root,
+        sandboxesDir: path.join(root, "sandboxes"),
+        worktreesDir: path.join(root, "proj.worktrees"),
         sync: {
           include: ["**"],
           exclude: [],
@@ -86,6 +89,9 @@ export function makeBench(): Bench {
     },
     git(...args: string[]) {
       return execFileSync("git", args, { cwd: project, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    },
+    gitIn(dir: string, ...args: string[]) {
+      return execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
     },
     gitInit() {
       this.git("init", "--quiet", "--initial-branch=master");

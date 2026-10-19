@@ -80,11 +80,19 @@ export class SyncEngine {
     this.transformer = new Transformer(config.replacements);
     this.mapper = new PathMapper(this.transformer);
     this.filter = new SyncFilter(config.sync);
+    // State and backups live in the main project's .anonymus/, whatever
+    // folder (worktree) the pair syncs: never in a worktree or the sandbox.
     this.state = new StateStore(config.projectRoot, config.profile.name);
-    this.trash = new Trash(config.projectRoot);
+    this.trash = new Trash(config.projectRoot, config.profile.name);
   }
 
+  /** Project side of this pair: its worktree, or the main folder without git. */
   get projectRoot(): string {
+    return this.config.profile.projectRoot ?? this.config.projectRoot;
+  }
+
+  /** Main project root: where anonymus.yaml and .anonymus/ are. */
+  get serviceRoot(): string {
     return this.config.projectRoot;
   }
 
@@ -327,8 +335,7 @@ export class SyncEngine {
 
   /**
    * Write `src` — the bytes of a file as it is on side `from` — to the other
-   * side, transformed. Does not record sync state; used directly to fill a
-   * sub-sandbox from a git commit without checking it out.
+   * side, transformed. Does not record sync state.
    */
   writeTransformed(from: Side, canonical: string, src: Buffer): TransferResult {
     const to = otherSide(from);

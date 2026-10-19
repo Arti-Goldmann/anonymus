@@ -4,14 +4,12 @@ import { structuredPatch, type Hunk } from "diff";
 import { encode, type Encoding } from "./encoding.js";
 import type { SyncEngine } from "./engine.js";
 import { decodeText, readBytes, sameText, walkFiles, type Eol, type TextFile } from "./fileio.js";
-import { MERGE_DIR } from "./filter.js";
 import type { SandboxEntry } from "./registry.js";
 import type { Workspace } from "./workspace.js";
 
-export interface MergeSourceResult {
-  name: string;
-  /** Patch file, relative to the target sub-sandbox. */
-  patch: string;
+export interface SourcePatch {
+  /** Absolute path of the written patch file. */
+  file: string;
   modified: number;
   added: number;
   deleted: number;
@@ -21,81 +19,31 @@ export interface MergeSourceResult {
   leaks: string[];
 }
 
-export interface MergePrepResult {
-  /** Absolute path of the `.anonymus-merge` folder in the target sub-sandbox. */
-  dir: string;
-  sources: MergeSourceResult[];
-}
-
-/** Sub-sandboxes branched off `target` — the natural sources to merge into it. */
+/** Pairs branched off `target` — the natural sources to merge into it. */
 export function defaultMergeSources(ws: Workspace, target: string): string[] {
-  const t = ws.registry.get(target);
-  return ws.registry
-    .list()
-    .filter((s) => s.name !== target && t?.branch && s.base?.branch === t.branch)
+  const t = ws.registry?.get(target);
+  return (ws.registry?.list() ?? [])
+    .filter((s) => s.name !== target && t && s.base?.branch === t.branch)
     .map((s) => s.name);
 }
 
 /**
- * Prepare the work of `sources` for an agent in `target` to merge: for each
- * source, a unified diff (git format) from the common ancestor to the
- * source's sub-sandbox folder as it is right now — including agent work that
- * was never synced to git. Everything is in sandbox form (placeholders only)
- * and lands in `<target sandbox>/.anonymus-merge/`, which is never synced.
+ * What `source` changed since `baseCommit`, as a unified diff (git format) in
+ * sandbox form — placeholders only — written to `file`. The agent resolving
+ * a merge conflict reads it to understand what the other side meant.
  */
-export function prepareMerge(ws: Workspace, target: string, sources: string[]): MergePrepResult {
-  const git = ws.git;
-  if (!git) {
-    throw new Error("проект не является git-репозиторием");
-  }
-  const targetEntry = ws.registry.get(target);
-  if (!targetEntry?.branch) {
-    throw new Error(`нет подпесочницы «${target}» с веткой`);
-  }
-  if (sources.length === 0) {
-    throw new Error("не выбрано ни одной подпесочницы для слияния");
-  }
-
-  const dir = path.join(ws.registry.absPath(targetEntry), MERGE_DIR);
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
-
-  const results: MergeSourceResult[] = [];
-  for (const name of sources) {
-    const source = ws.registry.get(name);
-    if (!source?.branch) {
-      throw new Error(`нет подпесочницы «${name}» с веткой`);
-    }
-    const baseCommit =
-      source.base && source.base.branch === targetEntry.branch
-        ? source.base.commit
-        : git.mergeBase(targetEntry.branch, source.branch);
-    const engine = ws.engineFor(source);
-    const { patch, text, stats } = diffSourceAgainstBase(ws, engine, source, targetEntry, baseCommit);
-    const file = `${name.replace(/[\\/:*?"<>|\s]+/g, "-")}.patch`;
-    fs.writeFileSync(path.join(dir, file), patch);
-    results.push({ name, patch: `${MERGE_DIR}/${file}`, ...stats, leaks: engine.transformer.findLeaks(text) });
-  }
-
-  const index = results
-    .map(
-      (r) =>
-        `${r.patch}: изменено ${r.modified}, добавлено ${r.added}, удалено ${r.deleted}` +
-        (r.binary ? `, бинарных ${r.binary} (только в списке)` : "")
-    )
-    .join("\n");
-  fs.writeFileSync(
-    path.join(dir, "index.txt"),
-    "Изменения подпесочниц относительно общей основы, git-формат.\n" +
-      "Каждый кусок записан в кодировке и с концами строк своего файла в этой песочнице:\n" +
-      "патчи применяются как есть (git apply), перекодировать ничего не нужно.\n\n" +
-      `${index}\n`,
-    "utf8"
-  );
-
-  targetEntry.mergeSources = sources;
-  ws.registry.save();
-  return { dir, sources: results };
+export function writeSourcePatch(
+  ws: Workspace,
+  source: SandboxEntry,
+  target: SandboxEntry,
+  baseCommit: string,
+  file: string
+): SourcePatch {
+  const engine = ws.engineFor(source.name);
+  const { patch, text, stats } = diffSourceAgainstBase(ws, engine, source, target, baseCommit);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, patch);
+  return { file, ...stats, leaks: engine.transformer.findLeaks(text) };
 }
 
 interface DiffStats {
@@ -174,7 +122,7 @@ function diffSourceAgainstBase(
   const git = ws.git!;
   const filter = engine.filter;
   const mapper = engine.mapper;
-  const targetRoot = ws.registry.absPath(target);
+  const targetRoot = target.sandbox;
 
   // Base: files of the common ancestor, by canonical (real) path.
   const base = new Set<string>();
@@ -185,7 +133,7 @@ function diffSourceAgainstBase(
   }
   // Source: the sub-sandbox folder as it is now.
   const current = new Set<string>();
-  const root = ws.registry.absPath(source);
+  const root = source.sandbox;
   for (const rel of walkFiles(root, (d) => filter.isDirExcluded(mapper.toCanonical(d)))) {
     const canonical = mapper.toCanonical(rel);
     if (filter.isSynced(canonical) && !mapper.sandboxPathProblem(rel)) {

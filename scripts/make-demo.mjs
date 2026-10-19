@@ -1,9 +1,10 @@
-// Creates (or resets) a demo stand: demo/proj (the "real" project) and an
-// empty demo/sandbox, plus a VS Code workspace showing both side by side.
+// Creates (or resets) a demo stand: demo/proj (the "real" project, a git repo)
+// plus empty demo/proj.worktrees (git worktrees of the sub-sandboxes) and
+// demo/sandboxes (the sandboxes themselves), and a VS Code workspace showing
+// all three.
 //
 //   npm run demo
-//   cd demo\proj
-//   anonymus
+//   demo\start.ps1      (n — create the first sub-sandbox)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -13,7 +14,8 @@ import iconv from "iconv-lite";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "demo");
 const proj = path.join(root, "proj");
-const sandbox = path.join(root, "sandbox");
+const worktrees = path.join(root, "proj.worktrees");
+const sandboxes = path.join(root, "sandboxes");
 
 /**
  * Empty a folder but keep the folder itself: it may be the current directory
@@ -42,13 +44,17 @@ function forceRm(p) {
 }
 
 fs.mkdirSync(root, { recursive: true });
+// The three folders are emptied, not deleted: they may be open in VS Code or a
+// terminal. Anything else (an older layout of the stand) goes.
+const kept = new Set(["proj", "proj.worktrees", "sandboxes"]);
 for (const name of fs.readdirSync(root)) {
-  if (name !== "proj" && name !== "sandbox") {
-    forceRm(path.join(root, name)); // includes sub-sandboxes created during a demo
+  if (!kept.has(name)) {
+    forceRm(path.join(root, name));
   }
 }
 clearDir(proj);
-clearDir(sandbox);
+clearDir(worktrees);
+clearDir(sandboxes);
 
 const crlf = (s) => s.replace(/\n/g, "\r\n");
 function write(rel, content) {
@@ -148,7 +154,8 @@ write(
   "anonymus.yaml",
   `# Демо-конфиг anonymus
 version: 1
-sandbox: ../sandbox
+# Песочницы подпесочниц; их git worktree — в ../proj.worktrees (по умолчанию).
+sandboxes_dir: ../sandboxes
 
 sync:
   include: ["**"]
@@ -193,9 +200,12 @@ fs.writeFileSync(
     {
       folders: [
         { name: "ПРОЕКТ (реальные имена)", path: "proj" },
-        { name: "ПЕСОЧНИЦА (плейсхолдеры)", path: "sandbox" },
+        { name: "WORKTREE ПОДПЕСОЧНИЦ (реальные имена)", path: "proj.worktrees" },
+        { name: "ПЕСОЧНИЦЫ (плейсхолдеры)", path: "sandboxes" },
       ],
-      settings: { "files.autoGuessEncoding": true },
+      // Each worktree is a git repository one level down: Source Control
+      // shows every one of them with its own changes.
+      settings: { "files.autoGuessEncoding": true, "git.repositoryScanMaxDepth": 1 },
     },
     null,
     2
@@ -216,9 +226,10 @@ Set-Location (Join-Path $PSScriptRoot "proj")
 );
 
 console.log(`Демо-стенд создан: ${root}
-  проект:    ${proj}
-  песочница: ${sandbox} (пустая)
+  проект:     ${proj}
+  worktree:   ${worktrees} (пусто)
+  песочницы:  ${sandboxes} (пусто)
 
 Дальше:
   code "${path.join(root, "demo.code-workspace")}"
-  & "${path.join(root, "start.ps1")}"`);
+  & "${path.join(root, "start.ps1")}"     затем n — первая подпесочница`);

@@ -2,37 +2,30 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
-import Spinner from "ink-spinner";
 import { SERVICE_DIR } from "../config/schema.js";
 import type { FileStatus, SyncEngine } from "../core/engine.js";
+import { abortMerge, continueMerge, startMerge, type MergeOutcome } from "../core/gitMerge.js";
+import type { PairProblem } from "../core/pairGuard.js";
 import { applyReconcile, planReconcile, summarize, type Strategy } from "../core/reconcile.js";
-import { scan, type ScanResult } from "../core/scanner.js";
-import { Syncer, type BranchChange, type SyncEvent } from "../core/syncer.js";
-import type { BranchProblem, Workspace } from "../core/workspace.js";
+import { scan } from "../core/scanner.js";
+import { Syncer, type SyncEvent } from "../core/syncer.js";
+import type { PairRef, Workspace } from "../core/workspace.js";
 import { openFolder } from "../platform.js";
 import { ConflictView } from "./ConflictView.js";
-import { CompactHeader, Header, HEADER_MIN_COLUMNS, HEADER_ROWS } from "./Header.js";
-import { LIVE_CHROME_ROWS, LiveView, type LiveStatus } from "./LiveView.js";
+import { CompactHeader, Header, HEADER_MIN_COLUMNS, HEADER_ROWS, type PairsSummary } from "./Header.js";
+import { PairsView } from "./PairsView.js";
+import { needsAttention, ZERO_STATS, type ActionResult, type Phase, type PairView } from "./pairState.js";
+import { ProblemView, type ProblemAction } from "./ProblemView.js";
 import { RECONCILE_COMPACT_ROWS, RECONCILE_FULL_ROWS, ReconcileView } from "./ReconcileView.js";
-import { SandboxesView, type ActionResult } from "./SandboxesView.js";
-import { BRANCH_VIEW_ROWS, BranchView } from "./BranchView.js";
-import { prepareMerge } from "../core/mergePrep.js";
-import { formatTime, theme } from "./theme.js";
+import { formatTime, plural, theme } from "./theme.js";
 import { useTerminalSize } from "./useTerminalSize.js";
 
 type Screen =
-  | "scanning"
-  | "reconcile"
-  | "applying"
-  | "switching"
-  | "live"
-  | "conflicts"
-  | "sandboxes"
-  | "branch"
-  | "stopping";
-
-/** Screens of the start-up flow: the mascot is always shown here. */
-const STARTUP_SCREENS: Screen[] = ["scanning", "reconcile", "applying", "switching"];
+  | { kind: "overview" }
+  | { kind: "reconcile"; pair: string }
+  | { kind: "conflicts"; pair: string }
+  | { kind: "problem"; pair: string }
+  | { kind: "stopping" };
 
 /** Live-sync events that mean a file actually moved; the first one folds the mascot. */
 const TRANSFER_KINDS = new Set<SyncEvent["kind"]>(["to-sandbox", "to-project", "deleted", "merged", "resolved"]);
@@ -40,16 +33,40 @@ const TRANSFER_KINDS = new Set<SyncEvent["kind"]>(["to-sandbox", "to-project", "
 /** Events kept in memory for the on-screen log (the journal file has all). */
 const MAX_EVENTS = 500;
 
+/** Shown on the reconcile screen of a pair whose worktree was re-created or re-linked. */
+const REVIEW_NOTE =
+  "Worktree этой подпесочницы создан заново: его незакоммиченная работа могла пропасть, а в песочнице она есть. " +
+  "Рекомендуется «Песочница → проект».";
+
 const now = () => new Date();
+
+function viewOf(ref: PairRef): PairView {
+  return {
+    name: ref.name,
+    branch: ref.branch,
+    base: ref.entry?.base?.branch ?? null,
+    phase: "waiting",
+    problem: null,
+    held: 0,
+    paused: false,
+    busy: false,
+    pending: 0,
+    stats: ZERO_STATS,
+    progress: [0, 0],
+    scan: null,
+    needsReview: !!ref.entry?.needsReview,
+    merge: ref.entry?.merge ?? null,
+  };
+}
 
 /**
  * Root component. The whole UI is one frame exactly as tall as the window
  * (drawn on the terminal's alternate screen, see cli.tsx), so resizing just
  * redraws the frame — nothing is left behind in the scrollback.
  *
- * The workspace holds all sub-sandboxes; `engine` is the active one. A profile
- * goes through: scan → (reconcile screen | automatic reconcile) → live sync.
- * Switching stops the syncer, switches the git branch and starts over.
+ * Every pair (sub-sandbox ⇄ its worktree) runs on its own: check → scan →
+ * (automatic reconcile | waits for the user) → live sync. A pair that becomes
+ * unsafe stops alone; the others keep syncing.
  */
 export function App({
   workspace,
@@ -62,27 +79,33 @@ export function App({
 }) {
   const { exit } = useApp();
   const { columns, rows } = useTerminalSize();
-  const [engine, setEngine] = useState<SyncEngine>(() => workspace.engineFor());
-  const engineRef = useRef(engine);
-  const [screen, setScreen] = useState<Screen>("scanning");
-  const [progress, setProgress] = useState<[number, number]>([0, 0]);
-  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
-  const [steps, setSteps] = useState<string[]>([]);
+  const engines = useRef(new Map<string, SyncEngine>());
+  const syncers = useRef(new Map<string, Syncer>());
+  const [pairs, setPairs] = useState<PairView[]>(() => workspace.pairs().map(viewOf));
+  const [heldFiles, setHeldFiles] = useState<Record<string, FileStatus[]>>({});
+  const [screen, setScreen] = useState<Screen>({ kind: "overview" });
   const [events, setEvents] = useState<SyncEvent[]>(() =>
     warnings.map((w) => ({ time: now(), kind: "warning" as const, message: w }))
   );
-  const [held, setHeld] = useState<FileStatus[]>([]);
-  const [status, setStatus] = useState<LiveStatus>({ paused: false, busy: false, pending: 0 });
-  const [stats, setStats] = useState({ toSandbox: 0, toProject: 0, deleted: 0 });
   const [fatal, setFatal] = useState<string | null>(null);
-  // Set when the branch was switched outside anonymus: sync stays stopped until the user picks.
-  const [branchChange, setBranchChange] = useState<BranchChange | null>(null);
-  // Set when a profile is about to start while the project is on another branch.
-  const [branchProblem, setBranchProblem] = useState<BranchProblem | null>(null);
-  // The mascot stays on the live screen until the first file moves.
+  // The mascot stays until the first file moves.
   const [folded, setFolded] = useState(false);
-  const syncerRef = useRef<Syncer | null>(null);
   const journal = useMemo(() => path.join(workspace.config.projectRoot, SERVICE_DIR, "anonymus.log"), [workspace]);
+
+  const update = useCallback((name: string, patch: Partial<PairView>) => {
+    setPairs((prev) => prev.map((p) => (p.name === name ? { ...p, ...patch } : p)));
+  }, []);
+
+  /** Re-read the pair list from the registry, keeping the live state of known pairs. */
+  const syncList = useCallback(() => {
+    setPairs((prev) =>
+      workspace.pairs().map((ref) => {
+        const old = prev.find((p) => p.name === ref.name);
+        const fresh = viewOf(ref);
+        return old ? { ...old, branch: fresh.branch, base: fresh.base, merge: fresh.merge, needsReview: fresh.needsReview } : fresh;
+      })
+    );
+  }, [workspace]);
 
   const pushEvent = useCallback(
     (ev: SyncEvent) => {
@@ -90,20 +113,28 @@ export function App({
       if (TRANSFER_KINDS.has(ev.kind)) {
         setFolded(true);
       }
-      if (ev.kind === "to-sandbox" || ev.kind === "to-project" || ev.kind === "deleted") {
-        setStats((s) => ({
-          toSandbox: s.toSandbox + (ev.kind === "to-sandbox" ? 1 : 0),
-          toProject: s.toProject + (ev.kind === "to-project" ? 1 : 0),
-          deleted: s.deleted + (ev.kind === "deleted" ? 1 : 0),
-        }));
+      if (ev.pair && (ev.kind === "to-sandbox" || ev.kind === "to-project" || ev.kind === "deleted")) {
+        setPairs((prev) =>
+          prev.map((p) =>
+            p.name === ev.pair
+              ? {
+                  ...p,
+                  stats: {
+                    toSandbox: p.stats.toSandbox + (ev.kind === "to-sandbox" ? 1 : 0),
+                    toProject: p.stats.toProject + (ev.kind === "to-project" ? 1 : 0),
+                    deleted: p.stats.deleted + (ev.kind === "deleted" ? 1 : 0),
+                  },
+                }
+              : p
+          )
+        );
       }
       try {
         fs.mkdirSync(path.dirname(journal), { recursive: true });
         const date = ev.time.toISOString().slice(0, 10);
-        const profile = engineRef.current.config.profile.name;
         fs.appendFileSync(
           journal,
-          `${date} ${formatTime(ev.time)}  [${profile}] ${ev.kind.padEnd(10)} ${ev.message}\n`,
+          `${date} ${formatTime(ev.time)}  [${ev.pair ?? "-"}] ${ev.kind.padEnd(10)} ${ev.message}\n`,
           "utf8"
         );
       } catch {
@@ -112,433 +143,495 @@ export function App({
     },
     [journal]
   );
-  const info = useCallback((message: string) => pushEvent({ time: now(), kind: "info", message }), [pushEvent]);
-  const warn = useCallback((message: string) => pushEvent({ time: now(), kind: "warning", message }), [pushEvent]);
-
-  /** First notice of a foreign checkout: leave screens that would write files, explain. */
-  const onForeignCheckout = useCallback(() => {
-    setScreen((s) => (s === "conflicts" ? "live" : s));
-    let dirty = false;
-    try {
-      dirty = workspace.git?.isDirty() ?? false;
-    } catch {
-      // Only a hint; the choice is the user's anyway.
-    }
-    if (dirty) {
-      warn("в проекте есть незакоммиченные изменения — git перенёс их при checkout; при переключении подпесочницы они попадут в неё");
-    }
-  }, [workspace, warn]);
-
-  const startLive = useCallback(
-    async (eng: SyncEngine, initiallyHeld: FileStatus[]) => {
-      const syncer = new Syncer(eng, initiallyHeld);
-      syncerRef.current = syncer;
-      syncer.on("event", pushEvent);
-      syncer.on("held", setHeld);
-      syncer.on("state", setStatus);
-      let noticed = false;
-      syncer.on("branch", (change) => {
-        setBranchChange(change);
-        if (!noticed) {
-          noticed = true;
-          onForeignCheckout();
-        }
-      });
-      setHeld(syncer.getHeld());
-      setScreen("live");
-      await syncer.start();
-    },
-    [pushEvent, onForeignCheckout]
+  const info = useCallback(
+    (message: string, pair?: string) => pushEvent({ time: now(), kind: "info", message, pair }),
+    [pushEvent]
+  );
+  const warn = useCallback(
+    (message: string, pair?: string) => pushEvent({ time: now(), kind: "warning", message, pair }),
+    [pushEvent]
+  );
+  const error = useCallback(
+    (message: string, pair?: string) => pushEvent({ time: now(), kind: "error", message, pair }),
+    [pushEvent]
   );
 
-  const reportOutcome = useCallback(
-    (eng: SyncEngine, outcome: Awaited<ReturnType<typeof applyReconcile>>, label: string) => {
-      info(
-        `${label}: в песочницу ${outcome.transfers.filter((t) => t.to === "sandbox").length}, ` +
-          `в проект ${outcome.transfers.filter((t) => t.to === "project").length}, ` +
-          `удалено ${outcome.deleted}, слито ${outcome.merged}, на решение ${outcome.held.length}`
-      );
-      for (const t of outcome.transfers) {
-        if (t.leaks.length > 0) {
-          warn(`возможная утечка в ${eng.mapper.toSandbox(t.canonical)}: ${t.leaks.join(", ")}`);
-        }
-      }
-      for (const f of outcome.failures) {
-        pushEvent({ time: now(), kind: "error", message: `${f.status.canonical}: ${f.error}` });
-      }
-    },
-    [info, warn, pushEvent]
-  );
-
-  /**
-   * Bring one sub-sandbox up: scan, then reconcile — automatically when it is
-   * unambiguous (an empty sandbox to fill, or only one-sided changes since the
-   * last sync), otherwise on the reconcile screen — and start live sync.
-   */
-  const startProfile = useCallback(
-    async (eng: SyncEngine) => {
-      engineRef.current = eng;
-      setEngine(eng);
-      setScanResult(null);
-      setBranchChange(null);
-      setHeld([]);
-      setStats({ toSandbox: 0, toProject: 0, deleted: 0 });
-      setProgress([0, 0]);
-      setFolded(false);
-      // Never scan a sub-sandbox against another branch's files: ask first.
-      let problem: BranchProblem | null = null;
-      try {
-        problem = workspace.branchProblem();
-      } catch (e) {
-        setFatal((e as Error).message);
-        return;
-      }
-      setBranchProblem(problem);
-      if (problem) {
-        setScreen("branch");
-        return;
-      }
-      setScreen("scanning");
-      try {
-        const result = await scan(eng, (done, total) => setProgress([done, total]));
-        if (result.clean) {
-          for (const s of result.statuses) eng.record(s.canonical);
-          eng.flush();
-          info(`«${eng.config.profile.name}»: проект и песочница совпадают (${result.statuses.length} файлов)`);
-          return startLive(eng, []);
-        }
-
-        const fillEmpty = result.sandboxFiles === 0 && result.projectFiles > 0 && result.pathErrors.length === 0;
-        const smart = summarize(planReconcile(result, "smart"));
-        const oneSided =
-          eng.state.size > 0 &&
-          !workspace.branchMismatch &&
-          smart.user === 0 &&
-          smart.deleteProject === 0 &&
-          smart.deleteSandbox === 0;
-        if (fillEmpty || oneSided) {
-          const strategy: Strategy = fillEmpty ? "project-wins" : "smart";
-          setScreen("applying");
-          const outcome = await applyReconcile(eng, planReconcile(result, strategy), (d, t) => setProgress([d, t]));
-          reportOutcome(eng, outcome, fillEmpty ? "песочница заполнена" : "автосверка");
-          return startLive(eng, outcome.held);
-        }
-        setScanResult(result);
-        setScreen("reconcile");
-      } catch (e) {
-        setFatal((e as Error).message);
-      }
-    },
-    [workspace, info, reportOutcome, startLive]
-  );
-
-  // Start-up: align the active sub-sandbox with the checked-out branch, then go.
-  useEffect(() => {
-    for (const n of workspace.reconcileWithGit()) {
-      pushEvent({ time: now(), kind: n.kind, message: n.message });
-    }
-    void startProfile(workspace.engineFor());
-    // Run once.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const leaveScreensOf = useCallback((name: string) => {
+    setScreen((s) => (s.kind !== "overview" && s.kind !== "stopping" && s.pair === name ? { kind: "overview" } : s));
   }, []);
 
-  const apply = useCallback(
-    (strategy: Strategy) => {
-      const eng = engineRef.current;
-      if (!scanResult) return;
-      setScreen("applying");
-      setProgress([0, 0]);
-      applyReconcile(eng, planReconcile(scanResult, strategy), (d, t) => setProgress([d, t]))
-        .then((outcome) => {
-          reportOutcome(eng, outcome, "сверка");
-          return startLive(eng, outcome.held);
-        })
-        .catch((e) => setFatal((e as Error).message));
-    },
-    [scanResult, reportOutcome, startLive]
-  );
-
-  const stopSyncer = useCallback(async () => {
-    const s = syncerRef.current;
-    syncerRef.current = null;
+  const stopPair = useCallback(async (name: string) => {
+    const s = syncers.current.get(name);
+    syncers.current.delete(name);
     if (s) {
       s.removeAllListeners();
       await s.stop();
     }
   }, []);
 
-  /** Stop syncing, run a branch operation, then bring the new active profile up. */
-  const runSwitch = useCallback(
-    async (title: string, operation: (step: (m: string) => void) => string[]) => {
-      setScreen("switching");
-      setSteps([title]);
-      await stopSyncer();
-      // Let the screen show before git (synchronous) runs.
-      await new Promise((r) => setTimeout(r, 30));
-      try {
-        const opWarnings = operation((m) => setSteps((s) => [...s, m]));
-        opWarnings.forEach(warn);
-        const active = workspace.active;
-        info(`активна «${active.name}»${active.branch ? ` ⎇ ${active.branch}` : ""}`);
-      } catch (e) {
-        pushEvent({ time: now(), kind: "error", message: (e as Error).message });
-      }
-      await startProfile(workspace.engineFor());
+  const block = useCallback(
+    (name: string, problem: PairProblem) => {
+      update(name, { phase: "blocked", problem, busy: false, pending: 0 });
+      leaveScreensOf(name);
     },
-    [stopSyncer, workspace, warn, info, pushEvent, startProfile]
+    [update, leaveScreensOf]
   );
 
-  const switchTo = useCallback(
-    (name: string) => void runSwitch(`переключаюсь на «${name}»`, (step) => workspace.switchTo(name, step)),
-    [runSwitch, workspace]
+  const reportOutcome = useCallback(
+    (name: string, eng: SyncEngine, outcome: Awaited<ReturnType<typeof applyReconcile>>, label: string) => {
+      info(
+        `${label}: в песочницу ${outcome.transfers.filter((t) => t.to === "sandbox").length}, ` +
+          `в проект ${outcome.transfers.filter((t) => t.to === "project").length}, ` +
+          `удалено ${outcome.deleted}, слито ${outcome.merged}, на решение ${outcome.held.length}`,
+        name
+      );
+      for (const t of outcome.transfers) {
+        if (t.leaks.length > 0) {
+          warn(`возможная утечка в ${eng.mapper.toSandbox(t.canonical)}: ${t.leaks.join(", ")}`, name);
+        }
+      }
+      for (const f of outcome.failures) {
+        error(`${f.status.canonical}: ${f.error}`, name);
+      }
+    },
+    [info, warn, error]
   );
-  /** Run a sub-sandbox action that does not switch branches; errors become a result. */
+
+  const startLive = useCallback(
+    async (name: string, eng: SyncEngine, initiallyHeld: FileStatus[], massDeleteGuard = true) => {
+      const syncer = new Syncer(eng, initiallyHeld, {
+        guard: () => workspace.check(name, eng.state.size > 0),
+        gitDir: workspace.gitDirOf(name),
+        massDeleteGuard,
+      });
+      syncers.current.set(name, syncer);
+      syncer.on("event", (ev) => pushEvent({ ...ev, pair: name }));
+      syncer.on("held", (h) => {
+        setHeldFiles((prev) => ({ ...prev, [name]: h }));
+        update(name, { held: h.length });
+      });
+      syncer.on("state", (s) => update(name, { paused: s.paused, busy: s.busy, pending: s.pending }));
+      syncer.on("blocked", (problem) => {
+        block(name, problem);
+        void stopPair(name);
+      });
+      const held = syncer.getHeld();
+      setHeldFiles((prev) => ({ ...prev, [name]: held }));
+      update(name, { phase: "live", problem: null, held: held.length, scan: null });
+      await syncer.start();
+    },
+    [workspace, pushEvent, update, block, stopPair]
+  );
+
+  /**
+   * Bring one pair up: safety check, scan, then reconcile — automatically when
+   * it is unambiguous (an empty sandbox to fill, or only one-sided changes
+   * since the last sync), otherwise it waits for the user — and live sync.
+   */
+  const bringUp = useCallback(
+    async (name: string, massDeleteGuard = true): Promise<Phase> => {
+      await stopPair(name);
+      const eng = workspace.engineFor(name);
+      engines.current.set(name, eng);
+      setHeldFiles((prev) => ({ ...prev, [name]: [] }));
+      update(name, { phase: "scanning", problem: null, held: 0, scan: null, progress: [0, 0], paused: false, busy: false, pending: 0 });
+
+      // Never scan a sandbox against a folder that is not its own worktree.
+      const before = workspace.check(name, eng.state.size > 0);
+      if (before) {
+        block(name, before);
+        return "blocked";
+      }
+      try {
+        const result = await scan(eng, (done, total) => update(name, { progress: [done, total] }));
+        const after = workspace.check(name, eng.state.size > 0);
+        if (after) {
+          block(name, after);
+          return "blocked";
+        }
+        const needsReview = !!workspace.pair(name).entry?.needsReview;
+        if (result.clean) {
+          for (const s of result.statuses) eng.record(s.canonical);
+          eng.flush();
+          workspace.markReviewed(name);
+          info(`проект и песочница совпадают (${result.statuses.length} файлов)`, name);
+          await startLive(name, eng, [], massDeleteGuard);
+          return "live";
+        }
+        const fillEmpty = result.sandboxFiles === 0 && result.projectFiles > 0 && result.pathErrors.length === 0;
+        const smart = summarize(planReconcile(result, "smart"));
+        const oneSided =
+          eng.state.size > 0 && !needsReview && smart.user === 0 && smart.deleteProject === 0 && smart.deleteSandbox === 0;
+        if (fillEmpty || oneSided) {
+          update(name, { phase: "applying" });
+          const strategy: Strategy = fillEmpty ? "project-wins" : "smart";
+          const outcome = await applyReconcile(eng, planReconcile(result, strategy), (d, t) =>
+            update(name, { progress: [d, t] })
+          );
+          reportOutcome(name, eng, outcome, fillEmpty ? "песочница заполнена" : "автосверка");
+          if (fillEmpty) {
+            workspace.markReviewed(name);
+          }
+          await startLive(name, eng, outcome.held, massDeleteGuard);
+          return "live";
+        }
+        update(name, { phase: "review", scan: result, needsReview });
+        return "review";
+      } catch (e) {
+        error((e as Error).message, name);
+        block(name, { code: "io-error", message: (e as Error).message });
+        return "blocked";
+      }
+    },
+    [workspace, stopPair, update, block, info, error, reportOutcome, startLive]
+  );
+
+  // Start-up: refuse unsafe registries, then bring every pair up in turn.
+  useEffect(() => {
+    void (async () => {
+      const problems = workspace.problems();
+      if (problems.length > 0) {
+        setFatal(problems.join("\n"));
+        return;
+      }
+      for (const p of workspace.pairs()) {
+        await bringUp(p.name);
+      }
+    })();
+    // Run once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const applyReview = useCallback(
+    (name: string, strategy: Strategy) => {
+      const eng = engines.current.get(name);
+      const result = pairs.find((p) => p.name === name)?.scan;
+      setScreen({ kind: "overview" });
+      if (!eng || !result) return;
+      const problem = workspace.check(name, eng.state.size > 0);
+      if (problem) {
+        block(name, problem);
+        return;
+      }
+      update(name, { phase: "applying", progress: [0, 0] });
+      void applyReconcile(eng, planReconcile(result, strategy), (d, t) => update(name, { progress: [d, t] }))
+        .then(async (outcome) => {
+          reportOutcome(name, eng, outcome, "сверка");
+          workspace.markReviewed(name);
+          syncList();
+          await startLive(name, eng, outcome.held);
+        })
+        .catch((e) => {
+          error((e as Error).message, name);
+          block(name, { code: "io-error", message: (e as Error).message });
+        });
+    },
+    [pairs, workspace, block, update, reportOutcome, syncList, startLive, error]
+  );
+
+  /** Why a pair cannot take part in a merge right now (null when it can). */
+  const settled = useCallback((name: string): string | null => {
+    const s = syncers.current.get(name);
+    if (!s) return "синхронизация не запущена — сначала сверка или исправление проблемы";
+    if (s.getProblem()) return s.getProblem()!.message;
+    const held = s.getHeld().length;
+    if (held > 0) return `${held} ${plural(held, "файл ждёт", "файла ждут", "файлов ждут")} решения`;
+    if (s.isPaused()) return "на паузе (p)";
+    if (!s.isIdle()) return "ещё синхронизируется — подождите";
+    return null;
+  }, []);
+
+  /** Run an action; errors become a failed result (and a log line). */
   const attempt = useCallback(
-    (action: () => ActionResult): ActionResult => {
+    (action: () => ActionResult, pair?: string): ActionResult => {
       try {
         return action();
       } catch (e) {
-        pushEvent({ time: now(), kind: "error", message: (e as Error).message });
+        error((e as Error).message, pair);
         return { ok: false, lines: [(e as Error).message] };
       }
     },
-    [pushEvent]
+    [error]
   );
 
-  const createSandbox = useCallback(
-    (name: string, from: string, switchToIt: boolean): ActionResult | void => {
-      if (switchToIt) {
-        void runSwitch(`создаю подпесочницу «${name}» от ${from}`, (step) =>
-          workspace.create(name, { from, switchTo: true }, step).warnings
-        );
-        return;
+  const describeMerge = useCallback(
+    (outcome: MergeOutcome): ActionResult => {
+      const t = outcome.target;
+      for (const name of outcome.merged) {
+        info(`слито в «${t}»: ${name}`, t);
       }
-      // The project stays on its branch: the new sub-sandbox is filled from git.
-      return attempt(() => {
-        const { entry, filled } = workspace.create(name, { from, switchTo: false });
-        const folder = workspace.registry.absPath(entry);
-        info(`создана подпесочница «${name}» ⎇ ${name} от ${from}: ${filled} файлов в ${folder}`);
-        return { ok: true, lines: [`«${name}» создана от ${from}: ${filled} файлов`, `папка ${folder} — агента можно запускать`] };
-      });
-    },
-    [runSwitch, workspace, attempt, info]
-  );
-  const removeSandbox = useCallback(
-    (name: string, dropStash: boolean): ActionResult =>
-      attempt(() => {
-        const { trashDir, warnings: w, stashDropped } = workspace.remove(name, () => {}, { dropStash });
-        w.forEach(warn);
-        const stashNote = stashDropped ? ", её stash удалён" : "";
-        info(
-          `подпесочница «${name}» удалена (папка в ${path.relative(workspace.config.projectRoot, trashDir)}), ` +
-            `ветка оставлена${stashNote}`
-        );
-        return { ok: true, lines: [`«${name}» удалена, папка в корзине${stashNote}`, ...w] };
-      }),
-    [workspace, attempt, warn, info]
-  );
-  const prepareMergeInto = useCallback(
-    (target: string, sources: string[]): ActionResult =>
-      attempt(() => {
-        const { dir, sources: results } = prepareMerge(workspace, target, sources);
-        const lines = results.map(
-          (r) =>
-            `${r.name}: изменено ${r.modified}, добавлено ${r.added}, удалено ${r.deleted}` +
-            (r.binary ? `, бинарных ${r.binary}` : "") +
-            (r.leaks.length ? ` — ⚠ утечка: ${r.leaks.join(", ")}` : "")
-        );
-        for (const r of results) {
-          if (r.leaks.length) warn(`возможная утечка в ${r.patch}: ${r.leaks.join(", ")}`);
-        }
-        info(`подготовлено слияние в «${target}»: ${sources.join(", ")}`);
+      if (outcome.leaks.length > 0) {
+        warn(`возможная утечка в заметках слияния: ${outcome.leaks.join(", ")}`, t);
+      }
+      if (outcome.stoppedAt) {
+        const n = outcome.conflicts.length;
+        warn(`слияние ${outcome.stoppedAt} в «${t}»: конфликт в ${n} ${plural(n, "файле", "файлах", "файлах")}`, t);
+        syncList();
         return {
           ok: true,
           lines: [
-            `Патчи готовы: ${dir}`,
-            ...lines,
-            `Скажите агенту в «${target}» применить .anonymus-merge/*.patch; потом k — закоммитить итог.`,
+            `${outcome.merged.length ? `слито: ${outcome.merged.join(", ")}; ` : ""}конфликт при слиянии ${outcome.stoppedAt}: ${n} ${plural(n, "файл", "файла", "файлов")}`,
+            `Скажите агенту в «${t}»: разреши конфликты слияния по .anonymus-merge/CONFLICTS.txt, собери и проверь.`,
+            "Когда маркеров не останется и всё синхронизируется — k (продолжить), a — прервать.",
           ],
         };
-      }),
-    [workspace, attempt, warn, info]
+      }
+      syncList();
+      const branch = workspace.pair(t).branch;
+      info(`слияние в «${t}» завершено`, t);
+      return {
+        ok: true,
+        lines: [
+          `слияние в «${t}» завершено${outcome.merged.length ? `: ${outcome.merged.join(", ")}` : ""}`,
+          `в main — в основной папке проекта: git merge --squash ${branch}`,
+        ],
+      };
+    },
+    [info, warn, syncList, workspace]
   );
-  const commitActive = useCallback(
-    (message: string): ActionResult =>
-      attempt(() => {
-        const branch = workspace.active.branch;
-        if (!workspace.commitActive(message)) {
-          return { ok: false, lines: ["нечего коммитить — незакоммиченных изменений нет"] };
+
+  const createPair = useCallback(
+    async (name: string, from: string): Promise<ActionResult> => {
+      let entryInfo: ActionResult;
+      try {
+        const entry = workspace.create(name, { from }, (m) => info(m, name));
+        syncList();
+        entryInfo = {
+          ok: true,
+          lines: [
+            `«${name}» создана${entry.base ? ` от ${entry.base.branch}` : ""}`,
+            `worktree ${entry.worktree}`,
+            `песочница ${entry.sandbox} — агента можно запускать`,
+          ],
+        };
+      } catch (e) {
+        error((e as Error).message, name);
+        return { ok: false, lines: [(e as Error).message] };
+      }
+      await bringUp(name);
+      return entryInfo;
+    },
+    [workspace, info, error, syncList, bringUp]
+  );
+
+  const removePair = useCallback(
+    async (name: string, force: boolean): Promise<ActionResult> => {
+      await stopPair(name);
+      try {
+        const { trashDir, warnings: w } = workspace.remove(name, { force }, (m) => info(m, name));
+        w.forEach((m) => warn(m, name));
+        engines.current.delete(name);
+        syncList();
+        info(`подпесочница удалена (корзина: ${path.relative(workspace.config.projectRoot, trashDir)}), ветка оставлена`, name);
+        return { ok: true, lines: [`«${name}» удалена, песочница в корзине, ветка осталась`, ...w] };
+      } catch (e) {
+        error((e as Error).message, name);
+        void bringUp(name);
+        return { ok: false, lines: [(e as Error).message] };
+      }
+    },
+    [workspace, stopPair, info, warn, error, syncList, bringUp]
+  );
+
+  const onProblemAction = useCallback(
+    async (name: string, action: ProblemAction) => {
+      setScreen({ kind: "overview" });
+      if (action === "remove") {
+        await removePair(name, false);
+        return;
+      }
+      await stopPair(name);
+      try {
+        if (action === "recreate") {
+          workspace.recreateWorktree(name, (m) => info(m, name));
+        } else if (action === "relink") {
+          workspace.relink(name);
+          info("worktree привязан заново", name);
+        } else if (action === "relocate") {
+          info(`worktree теперь в ${workspace.relocate(name)}`, name);
+        } else if (action === "checkout") {
+          workspace.checkoutBack(name);
+          info(`в worktree снова ветка ${workspace.pair(name).branch}`, name);
+        } else if (action === "refill") {
+          workspace.refillSandbox(name);
         }
-        info(`коммит в ${branch}: ${message}`);
-        return { ok: true, lines: [`закоммичено в ${branch}: ${message}`, `в main: git checkout main && git merge ${branch}`] };
-      }),
-    [workspace, attempt, info]
+      } catch (e) {
+        error((e as Error).message, name);
+      }
+      syncList();
+      const phase = await bringUp(name);
+      if (phase === "review") {
+        setScreen({ kind: "reconcile", pair: name });
+      } else if (phase === "blocked") {
+        setScreen({ kind: "problem", pair: name });
+      }
+    },
+    [workspace, stopPair, removePair, info, error, syncList, bringUp]
+  );
+
+  const openPair = useCallback(
+    (name: string) => {
+      const p = pairs.find((x) => x.name === name);
+      if (!p) return;
+      if (p.phase === "review") setScreen({ kind: "reconcile", pair: name });
+      else if (p.phase === "blocked") setScreen({ kind: "problem", pair: name });
+      else if (p.phase === "live") setScreen({ kind: "conflicts", pair: name });
+    },
+    [pairs]
   );
 
   const quit = useCallback(() => {
-    setScreen("stopping");
-    void stopSyncer().finally(() => exit());
-  }, [exit, stopSyncer]);
-
-  /** After a foreign checkout: the sub-sandbox of the branch now checked out, if any. */
-  const branchTarget = branchChange ? workspace.sandboxOfBranch(branchChange.actual) : undefined;
-  const adoptTarget = branchTarget && branchTarget.name !== workspace.active.name ? branchTarget : undefined;
-
-  /** After a foreign checkout: put the active sub-sandbox's branch back, then sync again. */
-  // If git refuses, startProfile finds the branch still wrong and asks again.
-  const checkoutBack = useCallback(
-    () => void runSwitch(`git checkout ${workspace.active.branch}`, (step) => workspace.checkoutActiveBranch(step)),
-    [workspace, runSwitch]
-  );
+    setScreen({ kind: "stopping" });
+    void Promise.all([...syncers.current.keys()].map((n) => stopPair(n))).finally(() => exit());
+  }, [exit, stopPair]);
 
   // Ctrl-C always stops cleanly (state saved), whatever screen is shown.
   useInput((input, key) => {
-    if (key.ctrl && input === "c" && screen !== "stopping") {
+    if (key.ctrl && input === "c" && screen.kind !== "stopping") {
       quit();
     }
   });
 
-  useInput(
-    (input) => {
-      const s = syncerRef.current;
-      if (input === "q" || input === "й") {
-        quit();
-      } else if (branchChange) {
-        // Only the choices of the branch-change frame; nothing syncs until one is made.
-        if ((input === "s" || input === "ы") && adoptTarget) {
-          switchTo(adoptTarget.name);
-        } else if (input === "x" || input === "ч") {
-          checkoutBack();
-        }
-      } else if ((input === "c" || input === "с") && s) {
-        setScreen("conflicts");
-      } else if (input === "b" || input === "и") {
-        setScreen("sandboxes");
-      } else if ((input === "p" || input === "з") && s) {
-        s.isPaused() ? s.resume() : s.pause();
-      } else if ((input === "r" || input === "к") && s) {
-        info("пересканирую обе стороны…");
-        s.rescan();
-      } else if (input === "o" || input === "щ") {
-        openFolder(engine.trash.root);
-      }
-    },
-    { isActive: screen === "live" }
-  );
+  const summary: PairsSummary = {
+    total: pairs.length,
+    attention: pairs.filter(needsAttention).length,
+    git: workspace.gitEnabled,
+  };
 
   // One row is left free: a frame as tall as the window would scroll it.
   const frameRows = Math.max(5, rows - 1);
-  // The mascot greets during start-up and stays on the live screen until the
-  // first file moves; then it folds into a one-line header and the log gets
-  // the space. Conflict and sub-sandbox screens always use the compact header.
-  const bodyMin =
-    screen === "reconcile"
-      ? RECONCILE_COMPACT_ROWS
-      : screen === "switching"
-        ? 6
-        : screen === "live"
-          ? LIVE_CHROME_ROWS + 3
-          : 2;
-  const showMascot = STARTUP_SCREENS.includes(screen) || (screen === "live" && !folded);
+  const bodyMin = screen.kind === "reconcile" ? RECONCILE_COMPACT_ROWS : 10;
+  const showMascot = screen.kind === "overview" && !folded;
   const fullHeader = showMascot && columns >= HEADER_MIN_COLUMNS && frameRows >= HEADER_ROWS + bodyMin;
   const bodyRows = frameRows - (fullHeader ? HEADER_ROWS : 1);
+  const current = screen.kind !== "overview" && screen.kind !== "stopping" ? pairs.find((p) => p.name === screen.pair) : undefined;
+  const maxItems = Math.max(1, Math.min(Math.max(pairs.length, 1), Math.floor(bodyRows / 3)));
 
   return (
     <Box flexDirection="column" height={frameRows} width={columns} overflow="hidden">
       {fullHeader ? (
-        <Header config={engine.config} version={version} />
+        <Header config={workspace.config} version={version} summary={summary} />
       ) : (
-        <CompactHeader config={engine.config} version={version} />
+        <CompactHeader config={workspace.config} version={version} summary={summary} />
       )}
 
       <Box flexDirection="column" flexGrow={1} overflow="hidden">
-        {fatal && <Text color={theme.error}>Ошибка: {fatal}</Text>}
-
-        {!fatal && (screen === "scanning" || screen === "applying") && (
-          <Text color={theme.accent}>
-            <Spinner type="dots" /> {screen === "scanning" ? "сравниваю проект и песочницу" : "применяю сверку"}
-            <Text color={theme.muted}>{progress[1] > 0 ? `  ${progress[0]}/${progress[1]}` : ""}</Text>
-          </Text>
-        )}
-
-        {!fatal && screen === "switching" && (
+        {fatal && (
           <Box flexDirection="column">
-            {steps.map((s, i) => (
-              <Text key={i} color={i === steps.length - 1 ? theme.accent : theme.muted} wrap="truncate-end">
-                {i === steps.length - 1 ? <Spinner type="dots" /> : "✓"} {s}
+            <Text color={theme.error}>Синхронизация не запущена — небезопасная настройка подпесочниц:</Text>
+            {fatal.split("\n").map((l, i) => (
+              <Text key={i} color={theme.error}>
+                {"  "}- {l}
               </Text>
             ))}
+            <Text color={theme.muted}>Исправьте .anonymus/sandboxes.json или anonymus.yaml и запустите снова. q — выход.</Text>
+            <FatalKeys onQuit={() => exit()} />
           </Box>
         )}
 
-        {!fatal && screen === "reconcile" && scanResult && (
-          <ReconcileView
-            scan={scanResult}
-            hasHistory={engine.state.size > 0}
-            compact={bodyRows < RECONCILE_FULL_ROWS}
-            onApply={apply}
-            onQuit={() => exit()}
-          />
-        )}
-
-        {!fatal && screen === "live" && (
-          <LiveView
-            status={status}
+        {!fatal && screen.kind === "overview" && (
+          <PairsView
+            workspace={workspace}
+            pairs={pairs}
             events={events}
-            heldCount={held.length}
-            stats={stats}
-            logRows={bodyRows - LIVE_CHROME_ROWS}
+            maxItems={maxItems}
+            rows={bodyRows}
             logPath={journal}
-            branchChange={branchChange}
-            adoptTarget={adoptTarget?.name ?? null}
-          />
-        )}
-
-        {!fatal && screen === "conflicts" && syncerRef.current && (
-          <ConflictView
-            held={held}
-            maxItems={Math.max(3, bodyRows - 12)}
-            onResolve={(c, how) => syncerRef.current!.resolve(c, how)}
-            onBack={() => setScreen("live")}
-          />
-        )}
-
-        {!fatal && screen === "sandboxes" && (
-          <SandboxesView
-            workspace={workspace}
-            heldCount={held.length}
-            maxItems={Math.max(3, bodyRows - 12)}
-            onSwitch={switchTo}
-            onCreate={createSandbox}
-            onRemove={removeSandbox}
-            onPrepareMerge={prepareMergeInto}
-            onCommit={commitActive}
-            onBack={() => setScreen(branchProblem ? "branch" : "live")}
-          />
-        )}
-
-        {!fatal && screen === "branch" && branchProblem && (
-          <BranchView
-            workspace={workspace}
-            problem={branchProblem}
-            events={events}
-            logRows={bodyRows - BRANCH_VIEW_ROWS}
-            onAdopt={switchTo}
-            onCreate={() =>
-              void runSwitch(`создаю подпесочницу для ветки ${branchProblem.actual}`, (step) =>
-                workspace.adoptCurrentBranch(step)
-              )
+            onOpen={openPair}
+            onConflicts={(name) => {
+              if (syncers.current.has(name)) setScreen({ kind: "conflicts", pair: name });
+            }}
+            onCreate={createPair}
+            onRemove={removePair}
+            onMerge={(target, sources) =>
+              attempt(() => describeMerge(startMerge(workspace, target, sources, settled)), target)
             }
-            onCheckout={() =>
-              void runSwitch(`git checkout ${branchProblem.expected}`, (step) => workspace.checkoutActiveBranch(step))
+            onContinueMerge={(target) => attempt(() => describeMerge(continueMerge(workspace, target, settled)), target)}
+            onAbortMerge={(target) =>
+              attempt(() => {
+                abortMerge(workspace, target);
+                syncList();
+                info("слияние прервано (git merge --abort)", target);
+                return { ok: true, lines: [`слияние в «${target}» прервано, worktree вернулся к состоянию до него`] };
+              }, target)
             }
-            onSandboxes={() => setScreen("sandboxes")}
+            onCommit={(name, message) =>
+              attempt(() => {
+                if (!workspace.commit(name, message)) {
+                  return { ok: false, lines: ["нечего коммитить — незакоммиченных изменений нет"] };
+                }
+                info(`коммит: ${message}`, name);
+                return { ok: true, lines: [`закоммичено в ${workspace.pair(name).branch}: ${message}`] };
+              }, name)
+            }
+            onPause={(name) => {
+              const s = syncers.current.get(name);
+              if (s) s.isPaused() ? s.resume() : s.pause();
+            }}
+            onRescan={(name) => {
+              const s = syncers.current.get(name);
+              if (s) {
+                info("пересканирую обе стороны…", name);
+                s.rescan();
+              } else {
+                void bringUp(name);
+              }
+            }}
+            onTrash={() => openFolder(path.join(workspace.config.projectRoot, SERVICE_DIR, "trash"))}
             onQuit={quit}
           />
         )}
 
-        {screen === "stopping" && <Text color={theme.muted}>останавливаю синхронизацию, сохраняю состояние…</Text>}
+        {!fatal && screen.kind === "reconcile" && current?.scan && (
+          <ReconcileView
+            key={current.name}
+            scan={current.scan}
+            hasHistory={(engines.current.get(current.name)?.state.size ?? 0) > 0}
+            compact={bodyRows < RECONCILE_FULL_ROWS}
+            pair={workspace.gitEnabled ? current.name : undefined}
+            recommended={current.needsReview ? "sandbox-wins" : undefined}
+            note={current.needsReview ? REVIEW_NOTE : undefined}
+            onApply={(strategy) => applyReview(current.name, strategy)}
+            onQuit={() => setScreen({ kind: "overview" })}
+          />
+        )}
+
+        {!fatal && screen.kind === "conflicts" && current && syncers.current.get(current.name) && (
+          <ConflictView
+            held={heldFiles[current.name] ?? []}
+            maxItems={Math.max(3, bodyRows - 12)}
+            onResolve={(c, how) => syncers.current.get(current.name)!.resolve(c, how)}
+            onBack={() => setScreen({ kind: "overview" })}
+          />
+        )}
+
+        {!fatal && screen.kind === "problem" && current?.problem && (
+          <ProblemView
+            pair={workspace.pair(current.name)}
+            problem={current.problem}
+            movedTo={safely(() => workspace.movedTo(current.name))}
+            onAction={(action) => void onProblemAction(current.name, action)}
+            onBack={() => setScreen({ kind: "overview" })}
+          />
+        )}
+
+        {screen.kind === "stopping" && <Text color={theme.muted}>останавливаю синхронизацию, сохраняю состояние…</Text>}
       </Box>
     </Box>
   );
+}
+
+function FatalKeys({ onQuit }: { onQuit: () => void }) {
+  useInput((input) => {
+    if (input === "q" || input === "й") onQuit();
+  });
+  return null;
+}
+
+function safely<T>(fn: () => T): T | null {
+  try {
+    return fn();
+  } catch {
+    return null;
+  }
 }

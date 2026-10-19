@@ -6,40 +6,42 @@ import { render } from "ink";
 import { ConfigError, findConfig, loadConfig } from "./config/loader.js";
 import { SERVICE_DIR } from "./config/schema.js";
 import { CONFIG_TEMPLATE } from "./config/template.js";
-import type { SyncEngine } from "./core/engine.js";
+import { abortMerge, continueMerge, startMerge, type MergeOutcome } from "./core/gitMerge.js";
 import { acquireLock } from "./core/lock.js";
-import { defaultMergeSources, prepareMerge } from "./core/mergePrep.js";
-import { Workspace } from "./core/workspace.js";
+import { defaultMergeSources } from "./core/mergePrep.js";
+import { RegistryFormatError } from "./core/registry.js";
 import { applyReconcile, planReconcile, type Strategy } from "./core/reconcile.js";
 import { KIND_LABEL, scan } from "./core/scanner.js";
 import { Syncer } from "./core/syncer.js";
+import { Workspace } from "./core/workspace.js";
 import { App } from "./ui/App.js";
 import { flickerFreeStdout } from "./ui/frameStdout.js";
 import { formatTime } from "./ui/theme.js";
 
-const HELP = `anonymus — автоматическая синхронизация проекта и песочницы с анонимизацией
+const HELP = `anonymus — автоматическая синхронизация проекта и песочниц с анонимизацией
 
 Запуск из корня проекта (там, где лежит anonymus.yaml):
 
-  anonymus              скан, сверка расхождений и живая синхронизация
+  anonymus              проверка, сверка и живая синхронизация всех подпесочниц
   anonymus init         создать anonymus.yaml из шаблона
   anonymus scan         только показать расхождения (код 1, если они есть)
 
-Подпесочницы (по одной на git-ветку проекта):
-  anonymus sandboxes                  список
-  anonymus sandbox new <имя> [--from <ветка>] [--no-switch]
-                                      новая ветка (от текущей или --from) + подпесочница;
-                                      --no-switch: проект не переключать, папку заполнить из ветки
-  anonymus sandbox switch <имя>       переключить проект на ветку подпесочницы
-  anonymus sandbox remove <имя> [--drop-stash]
-                                      удалить подпесочницу (папка в корзину);
-                                      --drop-stash: удалить и stash её ветки
+Подпесочницы (git-проект: у каждой своя ветка и свой git worktree рядом с проектом):
+  anonymus sandboxes                    список и состояние
+  anonymus sandbox new <имя> [--from <ветка>]
+                                        ветка (новая от текущей или --from; или существующая),
+                                        её worktree и песочница
+  anonymus sandbox remove <имя> [--force]
+                                        удалить: песочница — в корзину, worktree — git worktree remove,
+                                        ветка остаётся; --force — даже с незакоммиченным в worktree
 
-Слияние работы нескольких агентов:
-  anonymus merge <цель> [<источник>...]
-                                      патчи работы источников (по умолчанию — ветки,
-                                      созданные от цели) в <цель>/.anonymus-merge/
-  anonymus commit [-m <сообщение>]    закоммитить работу активной подпесочницы
+Слияние работы нескольких агентов (git merge в worktree цели):
+  anonymus merge <цель> [<источник>...] закоммитить работу источников (по умолчанию — подпесочницы,
+                                        созданные от цели) и слить их по очереди
+  anonymus merge --continue <цель>      конфликты разрешены — закоммитить и слить дальше
+  anonymus merge --abort <цель>         прервать слияние
+  anonymus commit <имя> [-m <сообщение>]
+                                        закоммитить незакоммиченное в worktree подпесочницы
 
 Опции:
   -c, --config <файл>   путь к конфигу (по умолчанию ./anonymus.yaml)
@@ -49,16 +51,15 @@ const HELP = `anonymus — автоматическая синхронизаци
   -h, --help            эта справка
 `;
 
-type SandboxAction = "new" | "switch" | "remove";
+type SandboxAction = "new" | "remove";
 
 interface Args {
   command: "start" | "init" | "scan" | "sandboxes" | "sandbox" | "merge" | "commit";
   sandboxAction?: SandboxAction;
-  sandboxName?: string;
+  name?: string;
   from?: string;
-  noSwitch?: boolean;
-  dropStash?: boolean;
-  mergeTarget?: string;
+  force?: boolean;
+  mergeMode?: "start" | "continue" | "abort";
   mergeSources?: string[];
   message?: string;
   config?: string;
@@ -91,19 +92,23 @@ function parseArgs(argv: string[]): Args {
     } else if (a === "sandbox") {
       const action = argv[++i];
       const name = argv[++i];
-      if (action !== "new" && action !== "switch" && action !== "remove") {
-        fail("sandbox: укажите new | switch | remove и имя");
+      if (action !== "new" && action !== "remove") {
+        fail("sandbox: укажите new | remove и имя");
       }
       if (!name) {
         fail(`sandbox ${action}: укажите имя подпесочницы`);
       }
       args.command = "sandbox";
       args.sandboxAction = action;
-      args.sandboxName = name;
+      args.name = name;
     } else if (a === "merge") {
       args.command = "merge";
-      args.mergeTarget = argv[++i];
-      if (!args.mergeTarget || args.mergeTarget.startsWith("-")) {
+      args.mergeMode = "start";
+      if (argv[i + 1] === "--continue" || argv[i + 1] === "--abort") {
+        args.mergeMode = argv[++i] === "--continue" ? "continue" : "abort";
+      }
+      args.name = argv[++i];
+      if (!args.name || args.name.startsWith("-")) {
         fail("merge: укажите подпесочницу-цель, в которую сливать");
       }
       args.mergeSources = [];
@@ -112,12 +117,14 @@ function parseArgs(argv: string[]): Args {
       }
     } else if (a === "commit") {
       args.command = "commit";
+      args.name = argv[++i];
+      if (!args.name || args.name.startsWith("-")) {
+        fail("commit: укажите подпесочницу");
+      }
     } else if (a === "--from") {
       args.from = argv[++i];
-    } else if (a === "--drop-stash") {
-      args.dropStash = true;
-    } else if (a === "--no-switch") {
-      args.noSwitch = true;
+    } else if (a === "--force") {
+      args.force = true;
     } else if (a === "-m" || a === "--message") {
       args.message = argv[++i];
     } else if (a === "-c" || a === "--config") {
@@ -171,7 +178,7 @@ function runInit(cwd: string): void {
     fs.appendFileSync(gitignore, `${prefix}\n# anonymus (реальные имена и служебные файлы)\n${missing.join("\n")}\n`);
     console.log(`В .gitignore добавлено: ${missing.join(", ")}`);
   }
-  console.log("Отредактируйте sandbox, sync.include и replacements, затем запустите `anonymus`.");
+  console.log("Отредактируйте sandbox / sandboxes_dir, sync.include и replacements, затем запустите `anonymus`.");
 }
 
 function load(cwd: string, explicit?: string): { workspace: Workspace; warnings: string[] } {
@@ -182,103 +189,177 @@ function load(cwd: string, explicit?: string): { workspace: Workspace; warnings:
     if (e instanceof ConfigError) {
       fail(`Ошибка в конфиге:\n  - ${e.problems.join("\n  - ")}`);
     }
+    if (e instanceof RegistryFormatError) {
+      fail(e.message, 1);
+    }
     throw e;
   }
 }
 
-async function runScan(engine: SyncEngine): Promise<void> {
-  const result = await scan(engine);
-  for (const [kind, n] of Object.entries(result.counts)) {
-    if (n > 0 && kind !== "ignored" && kind !== "gone") {
-      console.log(`${String(n).padStart(6)}  ${KIND_LABEL[kind as keyof typeof KIND_LABEL]}`);
+async function runScan(workspace: Workspace): Promise<void> {
+  let clean = true;
+  for (const pair of workspace.pairs()) {
+    const engine = workspace.engineFor(pair.name);
+    const problem = workspace.check(pair.name, engine.state.size > 0);
+    const title = workspace.gitEnabled ? `«${pair.name}»: ` : "";
+    if (problem) {
+      console.log(`${title}✖ ${problem.message}`);
+      clean = false;
+      continue;
     }
+    const result = await scan(engine);
+    console.log(`${title}${result.clean ? "совпадают" : "расходятся"}`);
+    for (const [kind, n] of Object.entries(result.counts)) {
+      if (n > 0 && kind !== "ignored" && kind !== "gone") {
+        console.log(`${String(n).padStart(6)}  ${KIND_LABEL[kind as keyof typeof KIND_LABEL]}`);
+      }
+    }
+    for (const s of result.statuses.filter((s) => s.kind !== "synced")) {
+      console.log(`  ${KIND_LABEL[s.kind].padEnd(28)} ${s.canonical}`);
+    }
+    for (const e of result.pathErrors) {
+      console.log(`  ошибка пути (${e.side === "project" ? "проект" : "песочница"}) ${e.path}: ${e.problem}`);
+    }
+    clean &&= result.clean;
   }
-  for (const s of result.statuses.filter((s) => s.kind !== "synced")) {
-    console.log(`  ${KIND_LABEL[s.kind].padEnd(28)} ${s.canonical}`);
-  }
-  for (const e of result.pathErrors) {
-    console.log(`  ошибка пути (${e.side === "project" ? "проект" : "песочница"}) ${e.path}: ${e.problem}`);
-  }
-  process.exit(result.clean ? 0 : 1);
+  process.exit(clean ? 0 : 1);
 }
 
 function printSandboxes(workspace: Workspace): void {
   if (!workspace.gitEnabled) {
-    console.log("(проект не git-репозиторий — доступна только подпесочница default)");
+    console.log("(проект не git-репозиторий — одна пара: папка проекта ⇄ sandbox)");
   }
-  for (const s of workspace.registry.list()) {
-    const mark = s.name === workspace.active.name ? "●" : "○";
-    const extra = [s.stash ? "есть stash" : "", fs.existsSync(workspace.registry.absPath(s)) ? "" : "папка не найдена"]
-      .filter(Boolean)
-      .join(", ");
-    console.log(`${mark} ${s.name.padEnd(24)} ⎇ ${(s.branch ?? "—").padEnd(24)} ${workspace.registry.absPath(s)}${extra ? `  (${extra})` : ""}`);
+  const pairs = workspace.pairs();
+  if (pairs.length === 0) {
+    console.log("подпесочниц нет — anonymus sandbox new <имя>");
+  }
+  for (const p of pairs) {
+    const problem = workspace.check(p.name, true);
+    const mark = problem ? "✖" : p.entry?.merge?.current ? "⇄" : "●";
+    const base = p.entry?.base ? ` от ${p.entry.base.branch}` : "";
+    console.log(`${mark} ${p.name.padEnd(24)} ⎇ ${(p.branch ?? "—") + base}`);
+    console.log(`    worktree  ${p.projectDir}`);
+    console.log(`    песочница ${p.sandboxDir}`);
+    if (problem) console.log(`    ✖ ${problem.message}`);
+    if (p.entry?.merge?.current) console.log(`    ⇄ слияние ${p.entry.merge.current}: разрешите конфликты, затем merge --continue`);
   }
 }
 
 function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: string, args: Args): void {
   const step = (m: string) => console.log(`  … ${m}`);
   try {
-    let warnings: string[] = [];
     if (action === "new") {
-      const created = workspace.create(name, { from: args.from, switchTo: !args.noSwitch }, step);
-      warnings = created.warnings;
-      if (args.noSwitch) {
-        console.log(`  … в подпесочницу записано файлов: ${created.filled}`);
-      }
-    } else if (action === "switch") {
-      warnings = workspace.switchTo(name, step);
+      workspace.create(name, { from: args.from }, step);
+      console.log("готово. Запустите anonymus — песочница заполнится из worktree.");
     } else {
-      const removed = workspace.remove(name, step, { dropStash: args.dropStash });
-      warnings = removed.warnings;
-      if (removed.stashDropped) {
-        console.log("  … stash ветки удалён");
-      }
+      const { warnings } = workspace.remove(name, { force: args.force }, step);
+      warnings.forEach((w) => console.log(`⚠ ${w}`));
+      console.log("готово.");
     }
-    warnings.forEach((w) => console.log(`⚠ ${w}`));
-    console.log("готово.");
     printSandboxes(workspace);
-    if (action !== "remove") {
-      console.log("Запустите anonymus, чтобы синхронизировать активную подпесочницу.");
-    }
   } catch (e) {
     fail(`Ошибка: ${(e as Error).message}`, 1);
   }
 }
 
-/** Line-by-line mode for non-interactive terminals, logs and CI. */
-async function runHeadless(engine: SyncEngine, warnings: string[], strategy?: Strategy): Promise<void> {
-  const log = (msg: string) => console.log(`${formatTime(new Date())}  ${msg}`);
-  for (const w of warnings) log(`⚠ ${w}`);
-  log(`проект   ${engine.projectRoot}`);
-  log(`песочница ${engine.sandboxRoot}`);
-
-  const result = await scan(engine);
-  let held = result.statuses.filter(() => false);
-  if (!result.clean) {
-    if (!strategy) {
-      fail("Проект и песочница расходятся. Укажите --strategy project|sandbox|smart|manual или запустите без --no-tui.", 1);
+/** Pairs that are not in sync right now cannot take part in a merge run from the CLI. */
+async function settledMap(workspace: Workspace, names: string[]): Promise<Map<string, string>> {
+  const reasons = new Map<string, string>();
+  for (const name of names) {
+    const engine = workspace.engineFor(name);
+    const problem = workspace.check(name, engine.state.size > 0);
+    if (problem) {
+      reasons.set(name, problem.message);
+    } else if (!(await scan(engine)).clean) {
+      reasons.set(name, "проект и песочница расходятся — запустите anonymus, чтобы синхронизировать");
     }
-    const outcome = await applyReconcile(engine, planReconcile(result, strategy));
-    held = outcome.held;
-    log(`сверка: перенесено ${outcome.transfers.length}, удалено ${outcome.deleted}, слито ${outcome.merged}, на решение ${outcome.held.length}`);
+  }
+  return reasons;
+}
+
+function printMerge(workspace: Workspace, outcome: MergeOutcome): void {
+  for (const name of outcome.merged) console.log(`  слито: ${name}`);
+  if (outcome.leaks.length) console.log(`⚠ возможная утечка в заметках слияния: ${outcome.leaks.join(", ")}`);
+  if (outcome.stoppedAt) {
+    console.log(`конфликт при слиянии ${outcome.stoppedAt}:`);
+    for (const c of outcome.conflicts) console.log(`  ${c}`);
+    console.log(`Заметки для агента: ${outcome.notesDir}`);
+    console.log(`Запустите anonymus (файлы с маркерами уйдут в песочницу «${outcome.target}»), дайте агенту их разрешить,`);
+    console.log(`затем: anonymus merge --continue ${outcome.target}`);
   } else {
-    await applyReconcile(engine, planReconcile(result, "smart"));
+    console.log(`слияние в «${outcome.target}» завершено. В main: git merge --squash ${workspace.pair(outcome.target).branch}`);
+    console.log("Запустите anonymus, чтобы результат синхронизировался в песочницу.");
+  }
+}
+
+/** Line-by-line mode for non-interactive terminals, logs and CI: all pairs at once. */
+async function runHeadless(workspace: Workspace, warnings: string[], strategy?: Strategy): Promise<void> {
+  const log = (msg: string, pair?: string) =>
+    console.log(`${formatTime(new Date())}  ${pair && workspace.gitEnabled ? `[${pair}] ` : ""}${msg}`);
+  for (const w of warnings) log(`⚠ ${w}`);
+  const problems = workspace.problems();
+  if (problems.length > 0) {
+    fail(`небезопасная настройка подпесочниц:\n  - ${problems.join("\n  - ")}`, 1);
+  }
+  const pairs = workspace.pairs();
+  if (pairs.length === 0) {
+    fail("подпесочниц нет — создайте: anonymus sandbox new <имя>", 1);
   }
 
-  const syncer = new Syncer(engine, held);
-  syncer.on("event", (e) => log(`${e.kind.padEnd(10)} ${e.message}`));
-  const stop = (code = 0) => {
+  const running = new Map<string, Syncer>();
+  let failed = false;
+  const stopAll = (code: number) => {
     log("останавливаюсь…");
-    void syncer.stop().then(() => process.exit(code));
+    void Promise.all([...running.values()].map((s) => s.stop())).then(() => process.exit(code));
   };
-  // A checkout done outside anonymus: nobody to ask what to do, so stop.
-  syncer.once("branch", ({ expected }) => {
-    log(`верните ветку (git checkout ${expected}) или переключите подпесочницу и запустите anonymus снова`);
-    stop(1);
-  });
-  await syncer.start();
-  process.on("SIGINT", () => stop());
-  process.on("SIGTERM", () => stop());
+
+  for (const pair of pairs) {
+    const engine = workspace.engineFor(pair.name);
+    log(`${pair.projectDir} ⇄ ${pair.sandboxDir}`, pair.name);
+    const problem = workspace.check(pair.name, engine.state.size > 0);
+    if (problem) {
+      log(`✖ ${problem.message} — не запускаю`, pair.name);
+      failed = true;
+      continue;
+    }
+    const result = await scan(engine);
+    let held = result.statuses.filter(() => false);
+    if (!result.clean) {
+      if (!strategy) {
+        log("проект и песочница расходятся — укажите --strategy project|sandbox|smart|manual или запустите без --no-tui", pair.name);
+        failed = true;
+        continue;
+      }
+      const outcome = await applyReconcile(engine, planReconcile(result, strategy));
+      held = outcome.held;
+      log(`сверка: перенесено ${outcome.transfers.length}, удалено ${outcome.deleted}, слито ${outcome.merged}, на решение ${outcome.held.length}`, pair.name);
+    } else {
+      await applyReconcile(engine, planReconcile(result, "smart"));
+    }
+    workspace.markReviewed(pair.name);
+
+    const syncer = new Syncer(engine, held, {
+      guard: () => workspace.check(pair.name, engine.state.size > 0),
+      gitDir: workspace.gitDirOf(pair.name),
+    });
+    syncer.on("event", (e) => log(`${e.kind.padEnd(10)} ${e.message}`, pair.name));
+    // Nobody to ask what to do: this pair stops, the others go on.
+    syncer.once("blocked", () => {
+      failed = true;
+      running.delete(pair.name);
+      void syncer.stop();
+      log("пара остановлена — разберитесь и запустите anonymus снова", pair.name);
+      if (running.size === 0) stopAll(1);
+    });
+    running.set(pair.name, syncer);
+    await syncer.start();
+  }
+  if (running.size === 0) {
+    stopAll(1);
+    return;
+  }
+  process.on("SIGINT", () => stopAll(failed ? 1 : 0));
+  process.on("SIGTERM", () => stopAll(failed ? 1 : 0));
 }
 
 async function main(): Promise<void> {
@@ -290,11 +371,9 @@ async function main(): Promise<void> {
     return;
   }
   const { workspace, warnings } = load(cwd, args.config);
-  const notices = workspace.reconcileWithGit();
 
   if (args.command === "scan") {
-    notices.forEach((n) => console.log(`${n.kind === "warning" ? "⚠" : "·"} ${n.message}`));
-    await runScan(workspace.engineFor());
+    await runScan(workspace);
     return;
   }
   if (args.command === "sandboxes") {
@@ -302,47 +381,51 @@ async function main(): Promise<void> {
     return;
   }
 
-  // One running anonymus per project, whatever sub-sandbox is active: two
-  // instances would fight over the checked-out branch.
+  // One running anonymus per project: it syncs all pairs, and two instances
+  // would race on the same folders and sync state.
   const lock = acquireLock(path.join(workspace.config.projectRoot, SERVICE_DIR));
   if ("heldBy" in lock) {
     fail(
       `anonymus уже запущен для этого проекта (процесс ${lock.heldBy}).\n` +
-        "Два экземпляра мешали бы друг другу — остановите первый (q) и повторите.",
+        "Два экземпляра мешали бы друг другу — остановите первый (q) или сделайте это в его интерфейсе.",
       1
     );
   }
   process.on("exit", lock.release);
 
   if (args.command === "sandbox") {
-    runSandboxCommand(workspace, args.sandboxAction!, args.sandboxName!, args);
+    runSandboxCommand(workspace, args.sandboxAction!, args.name!, args);
     return;
   }
   if (args.command === "merge") {
-    const target = args.mergeTarget!;
-    const sources = args.mergeSources!.length ? args.mergeSources! : defaultMergeSources(workspace, target);
+    const target = args.name!;
     try {
-      const { dir, sources: results } = prepareMerge(workspace, target, sources);
-      for (const r of results) {
-        console.log(
-          `${r.name.padEnd(24)} изменено ${r.modified}, добавлено ${r.added}, удалено ${r.deleted}` +
-            (r.binary ? `, бинарных ${r.binary}` : "") +
-            (r.leaks.length ? `  ⚠ утечка: ${r.leaks.join(", ")}` : "")
-        );
+      if (args.mergeMode === "abort") {
+        abortMerge(workspace, target);
+        console.log(`слияние в «${target}» прервано.`);
+        return;
       }
-      console.log(`Патчи: ${dir}\nСкажите агенту в «${target}» применить .anonymus-merge/*.patch.`);
+      if (args.mergeMode === "continue") {
+        const reasons = await settledMap(workspace, [target]);
+        printMerge(workspace, continueMerge(workspace, target, (n) => reasons.get(n) ?? null));
+        return;
+      }
+      const sources = args.mergeSources!.length ? args.mergeSources! : defaultMergeSources(workspace, target);
+      const reasons = await settledMap(workspace, [target, ...sources]);
+      printMerge(workspace, startMerge(workspace, target, sources, (n) => reasons.get(n) ?? null));
     } catch (e) {
       fail(`Ошибка: ${(e as Error).message}`, 1);
     }
     return;
   }
   if (args.command === "commit") {
+    const name = args.name!;
     try {
-      const message = args.message ?? workspace.defaultCommitMessage();
-      if (!workspace.commitActive(message)) {
+      const message = args.message ?? workspace.defaultCommitMessage(name);
+      if (!workspace.commit(name, message)) {
         fail("нечего коммитить — незакоммиченных изменений нет", 1);
       }
-      console.log(`закоммичено в ${workspace.active.branch}: ${message}`);
+      console.log(`закоммичено в ${workspace.pair(name).branch}: ${message}`);
     } catch (e) {
       fail(`Ошибка: ${(e as Error).message}`, 1);
     }
@@ -350,22 +433,7 @@ async function main(): Promise<void> {
   }
 
   if (!args.tui || !process.stdout.isTTY || !process.stdin.isTTY) {
-    // Nobody to ask: refuse before the scan could copy another branch in.
-    const problem = workspace.branchProblem();
-    if (problem) {
-      fail(
-        `в проекте ветка ${problem.actual ?? "(отделённый HEAD)"}, а подпесочница «${workspace.active.name}» ` +
-          `привязана к ${problem.expected} — синхронизация не запущена.\n` +
-          `Верните ветку (git checkout ${problem.expected}), переключите подпесочницу ` +
-          `(anonymus sandbox switch <имя>) или запустите без --no-tui, чтобы создать подпесочницу для этой ветки.`,
-        1
-      );
-    }
-    await runHeadless(
-      workspace.engineFor(),
-      [...warnings, ...notices.map((n) => n.message)],
-      args.strategy
-    );
+    await runHeadless(workspace, warnings, args.strategy);
     return;
   }
   // Full-screen UI on the alternate screen: resizing redraws one frame instead

@@ -39,11 +39,20 @@ export function ReconcileView({
   scan,
   hasHistory,
   compact,
+  pair,
+  recommended,
+  note,
   onApply,
   onQuit,
 }: {
   scan: ScanResult;
   hasHistory: boolean;
+  /** Pair being reconciled (shown in the title). */
+  pair?: string;
+  /** Option to preselect instead of the usual default. */
+  recommended?: Strategy;
+  /** Why this pair needs a careful look (e.g. its worktree was re-created). */
+  note?: string;
   /** Small window: drop hints and spacing so the menu stays visible. */
   compact: boolean;
   onApply: (strategy: Strategy) => void;
@@ -83,7 +92,8 @@ export function ReconcileView({
     ],
     [sandboxEmpty, hasHistory]
   );
-  const defaultIndex = sandboxEmpty ? 0 : hasHistory ? 2 : 0;
+  const preferred = recommended ? options.findIndex((o) => o.strategy === recommended) : -1;
+  const defaultIndex = preferred >= 0 ? preferred : sandboxEmpty ? 0 : hasHistory ? 2 : 0;
   const [index, setIndex] = useState(defaultIndex);
   const [confirming, setConfirming] = useState<Strategy | null>(null);
   const [showFiles, setShowFiles] = useState(false);
@@ -99,7 +109,7 @@ export function ReconcileView({
       }
       return;
     }
-    if (input === "q" || input === "й") {
+    if (input === "q" || input === "й" || key.escape) {
       onQuit();
     } else if (input === "d" || input === "в") {
       setShowFiles((v) => !v);
@@ -130,8 +140,13 @@ export function ReconcileView({
         flexShrink={0}
       >
         <Text bold wrap="truncate-end">
-          Проект и песочница расходятся — нужно решить, прежде чем начать синхронизацию
+          {pair ? `«${pair}»: ` : ""}проект и песочница расходятся — нужно решить, прежде чем начать синхронизацию
         </Text>
+        {note && (
+          <Text color={theme.warn} wrap="wrap">
+            {note}
+          </Text>
+        )}
         <Box marginTop={compact ? 0 : 1} flexDirection="column">
           {KIND_ORDER.filter((k) => scan.counts[k] > 0).map((k) => (
             <Text key={k}>
@@ -187,7 +202,7 @@ export function ReconcileView({
           ))}
           <Box marginTop={compact ? 0 : 1}>
             <Text color={theme.muted} wrap="truncate-end">
-              ↑↓ / 1–4 выбрать · Enter подтвердить · d список файлов · q выйти
+              ↑↓ / 1–4 выбрать · Enter подтвердить · d список файлов · q / Esc назад
             </Text>
           </Box>
         </Box>

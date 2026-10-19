@@ -1,11 +1,12 @@
-// Plays a scripted session on the demo stand while `anonymus` is running:
+// Plays a scripted session on one pair of the demo stand while `anonymus` is running:
 //   1. an AI agent works in the sandbox (placeholder names only);
-//   2. a developer works in the project (real names);
+//   2. a developer works in the pair's worktree (real names);
 //   3. both edit at the same time: one clean auto-merge, one real conflict.
 //
 //   npm run demo          # fresh stand
-//   demo\start.ps1        # in one terminal: start anonymus, fill the sandbox
+//   demo\start.ps1        # in one terminal: start anonymus, n — create a pair
 //   npm run demo:play     # in another terminal: watch the log in the first one
+//   (PAIR=<name> picks the pair; the first one by default)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -13,8 +14,27 @@ import { fileURLToPath } from "node:url";
 import iconv from "iconv-lite";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "demo");
-const P = path.join(root, "proj");
-const S = path.join(root, "sandbox");
+const PROJ = path.join(root, "proj");
+
+/** The pair to play on: its worktree (project side) and its sandbox. */
+function pickPair() {
+  let pairs = [];
+  try {
+    pairs = JSON.parse(fs.readFileSync(path.join(PROJ, ".anonymus", "sandboxes.json"), "utf8")).sandboxes ?? [];
+  } catch {
+    // no pairs yet
+  }
+  const pair = process.env.PAIR ? pairs.find((p) => p.name === process.env.PAIR) : pairs[0];
+  if (!pair) {
+    console.error("На стенде нет подпесочниц: запустите demo\\start.ps1 и создайте её клавишей n.");
+    process.exit(1);
+  }
+  console.log(`подпесочница «${pair.name}»: ${pair.worktree} ⇄ ${pair.sandbox}`);
+  return pair;
+}
+const PAIR = pickPair();
+const P = PAIR.worktree;
+const S = PAIR.sandbox;
 const STEP_MS = Number(process.env.STEP_MS ?? 1500);
 const PHASE_MS = Number(process.env.PHASE_MS ?? 4000);
 
@@ -53,7 +73,7 @@ function edit(file, change, eol) {
 }
 
 function requireRunning() {
-  const lock = path.join(P, ".anonymus", "lock");
+  const lock = path.join(PROJ, ".anonymus", "lock");
   const sandboxReady = fs.existsSync(path.join(S, "MyProject_cpu01", "main.c"));
   let running = false;
   try {
@@ -64,8 +84,8 @@ function requireRunning() {
   }
   if (!running || !sandboxReady) {
     console.error(
-      "Сначала запустите anonymus на стенде и заполните песочницу:\n" +
-        "  npm run demo\n  demo\\start.ps1   (Enter, Enter)\n" +
+      "Сначала запустите anonymus на стенде и создайте подпесочницу:\n" +
+        "  npm run demo\n  demo\\start.ps1   (n, имя, Enter)\n" +
         "и в другом терминале снова npm run demo:play"
     );
     process.exit(1);

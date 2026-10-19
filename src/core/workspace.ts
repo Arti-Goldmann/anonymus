@@ -1,191 +1,172 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isInside } from "../config/loader.js";
 import { SERVICE_DIR, type AnonymusConfig } from "../config/schema.js";
 import { SyncEngine } from "./engine.js";
-import { Git, GitError } from "./git.js";
+import { Git, readWorktreeLink } from "./git.js";
+import { checkPair, findMarkedWorktree, pairGitDir, writeMark, type PairProblem } from "./pairGuard.js";
 import { Registry, type SandboxEntry } from "./registry.js";
 import { Transformer } from "./transformer.js";
+import { trashStamp } from "./trash.js";
 
 /** Progress callback for multi-step operations (shown in the UI). */
 export type StepReporter = (message: string) => void;
 
-/** The project is on another branch than the active sub-sandbox. */
-export interface BranchProblem {
-  /** Branch of the active sub-sandbox. */
-  expected: string;
-  /** Branch checked out in the project; null for a detached HEAD. */
-  actual: string | null;
-  /** Sub-sandbox of `actual`, if there is one. */
-  target: string | null;
+/** One sync pair as the UI sees it. */
+export interface PairRef {
+  name: string;
+  /** Branch of the worktree; null for a project without git. */
+  branch: string | null;
+  /** Project side: the pair's worktree (the main folder without git). */
+  projectDir: string;
+  sandboxDir: string;
+  /** Registry entry; null for the single pair of a project without git. */
+  entry: SandboxEntry | null;
 }
 
-export interface StartupNotice {
-  kind: "info" | "warning";
-  message: string;
-}
+/** Name of the single pair of a project that is not a git repository. */
+export const PLAIN_PAIR = "default";
 
 /**
- * The project plus all its sub-sandboxes. Each sub-sandbox is tied to one git
- * branch of the project; exactly one is active and synced. Switching stashes
- * the project's uncommitted work for the current branch, checks out the target
- * branch and restores that branch's stash.
+ * The project and its sync pairs.
  *
- * The caller stops the running Syncer before switching / creating and starts a
- * new one (for `engineFor(active)`) afterwards.
+ * In a git project every sub-sandbox is paired with its own git worktree of
+ * the project (created next to it, in `worktrees_dir`), and all pairs sync at
+ * the same time. The main project folder is never synced: it belongs to the
+ * user, who may check out whatever they like there.
+ *
+ * Without git there is exactly one pair: the project folder ⇄ `sandbox:`.
  */
 export class Workspace {
   readonly git: Git | null;
-  readonly registry: Registry;
+  /** Null for a project without git. */
+  readonly registry: Registry | null;
+  /** The repository's shared .git folder. */
+  readonly commonGitDir: string | null;
   private readonly transformer: Transformer;
-  /** The project's branch is not linked to the active sub-sandbox. */
-  branchMismatch = false;
 
   constructor(readonly config: AnonymusConfig) {
     const git = new Git(config.projectRoot);
     this.git = git.isRepo() ? git : null;
+    this.commonGitDir = this.git?.commonGitDir() ?? null;
     this.transformer = new Transformer(config.replacements);
-    this.registry = new Registry(config, this.git?.currentBranch() ?? null);
+    this.registry = this.git ? new Registry(config) : null;
   }
 
   get gitEnabled(): boolean {
     return this.git !== null;
   }
 
-  get active(): SandboxEntry {
-    return this.registry.active;
-  }
-
-  /** A sync engine for one sub-sandbox (the active one by default). */
-  engineFor(entry: SandboxEntry = this.registry.active): SyncEngine {
-    return new SyncEngine({ ...this.config, profile: this.registry.profileOf(entry) });
-  }
-
-  /**
-   * Make the active sub-sandbox match the branch actually checked out in the
-   * project (someone may have switched branches by hand).
-   */
-  reconcileWithGit(): StartupNotice[] {
-    const notices: StartupNotice[] = [];
-    this.branchMismatch = false;
-    const branch = this.git?.currentBranch() ?? null;
-    if (!this.git || !branch) {
-      this.registry.save();
-      return notices;
+  /** Configuration problems that make syncing unsafe (empty when fine). */
+  problems(): string[] {
+    if (!this.registry) {
+      return this.config.profile.sandboxRoot ? [] : ["проект не git-репозиторий: укажите sandbox: в anonymus.yaml"];
     }
-    const active = this.registry.active;
-    if (active.branch === null) {
-      active.branch = branch;
-    } else if (active.branch !== branch) {
-      const match = this.sandboxOfBranch(branch);
-      if (match) {
-        this.registry.setActive(match.name);
-        notices.push({
-          kind: "info",
-          message: `в проекте ветка ${branch} — активна её подпесочница «${match.name}»`,
-        });
-      } else {
-        this.branchMismatch = true;
-        notices.push({
-          kind: "warning",
-          message:
-            `в проекте ветка ${branch}, а подпесочница «${active.name}» привязана к ${active.branch} — ` +
-            `синхронизация не запущена, пока не выбрано, что делать`,
-        });
+    return this.registry.overlaps();
+  }
+
+  pairs(): PairRef[] {
+    if (!this.registry) {
+      if (!this.config.profile.sandboxRoot) {
+        return [];
       }
+      return [
+        {
+          name: PLAIN_PAIR,
+          branch: null,
+          projectDir: this.config.projectRoot,
+          sandboxDir: this.config.profile.sandboxRoot,
+          entry: null,
+        },
+      ];
     }
-    this.registry.save();
-    return notices;
+    return this.registry.list().map((e) => ({
+      name: e.name,
+      branch: e.branch,
+      projectDir: e.worktree,
+      sandboxDir: e.sandbox,
+      entry: e,
+    }));
   }
 
-  /** The sub-sandbox tied to a branch, if there is one. */
-  sandboxOfBranch(branch: string | null): SandboxEntry | undefined {
-    return branch === null ? undefined : this.registry.list().find((s) => s.branch === branch);
+  pair(name: string): PairRef {
+    const p = this.pairs().find((x) => x.name === name);
+    if (!p) {
+      throw new Error(`нет подпесочницы «${name}»`);
+    }
+    return p;
+  }
+
+  private entry(name: string): SandboxEntry {
+    const e = this.registry?.get(name);
+    if (!e) {
+      throw new Error(`нет подпесочницы «${name}»`);
+    }
+    return e;
+  }
+
+  /** A fresh sync engine for one pair (loads its sync state from disk). */
+  engineFor(name: string): SyncEngine {
+    if (!this.registry) {
+      return new SyncEngine(this.config);
+    }
+    return new SyncEngine({ ...this.config, profile: this.registry.profileOf(this.entry(name)) });
   }
 
   /**
-   * The project's checked-out branch is not the active sub-sandbox's one.
-   * Syncing now would copy the other branch into this sub-sandbox, so the
-   * caller must not scan until the user picks what to do. Null when fine
-   * (or when there is no git / no branch to compare).
+   * Is it safe to sync this pair right now? See core/pairGuard.ts. Called
+   * before the first scan and continuously while syncing.
    */
-  branchProblem(): BranchProblem | null {
-    const expected = this.registry.active.branch;
-    if (!this.git || !expected) {
-      return null;
+  check(name: string, hasHistory: boolean): PairProblem | null {
+    if (!this.registry) {
+      return hasHistory && !fs.existsSync(this.config.profile.sandboxRoot)
+        ? { code: "sandbox-missing", message: `папки песочницы ${this.config.profile.sandboxRoot} нет` }
+        : null;
     }
-    const actual = this.git.currentBranch();
-    if (actual === expected) {
-      return null;
-    }
-    const target = this.sandboxOfBranch(actual);
-    return { expected, actual, target: target?.name ?? null };
+    return checkPair(this.entry(name), this.commonGitDir!, { hasHistory });
   }
 
-  /** Why the checked-out branch cannot get its own sub-sandbox, or null if it can. */
-  validateAdopt(branch: string): string | null {
-    if (this.registry.get(branch) || this.sandboxOfBranch(branch)) {
-      return `подпесочница для ветки ${branch} уже есть`;
+  /** Git folder of the pair's worktree (HEAD, index.lock), if it is ours. */
+  gitDirOf(name: string): string | null {
+    if (!this.registry) {
+      return this.git ? this.git.gitDir() : null;
     }
-    const folder = this.folderFor(branch);
-    if (isInside(folder, this.config.projectRoot)) {
-      return `папка ${folder} оказалась бы внутри проекта — проверьте sandboxes_dir`;
-    }
-    if (fs.existsSync(folder) && fs.readdirSync(folder).length > 0) {
-      return `папка ${folder} уже существует и не пуста`;
-    }
-    return null;
+    return pairGitDir(this.entry(name), this.commonGitDir!);
   }
 
-  /**
-   * A new sub-sandbox for the branch already checked out in the project (no
-   * new branch is created) and make it active. It starts empty: the next scan
-   * fills it from the project.
-   */
-  adoptCurrentBranch(step: StepReporter = () => {}): string[] {
-    const branch = this.git?.currentBranch() ?? null;
-    if (!branch) {
-      throw new Error("в проекте не выбрана ветка (отделённый HEAD) — подпесочницу привязать не к чему");
-    }
-    const problem = this.validateAdopt(branch);
+  /** Git of the pair's worktree. Refuses when the folder is not the pair's worktree. */
+  gitOf(name: string): Git {
+    const problem = this.check(name, false);
     if (problem) {
-      throw new Error(problem);
+      throw new Error(problem.message);
     }
-    const folder = this.folderFor(branch);
-    step(`создаю папку ${folder}`);
-    fs.mkdirSync(folder, { recursive: true });
-    this.registry.add({ name: branch, absPath: folder, branch });
-    this.registry.setActive(branch);
-    this.branchMismatch = false;
-    this.registry.save();
-    return [];
+    return new Git(this.entry(name).worktree);
   }
 
-  /**
-   * Undo a `git checkout` made outside anonymus: put the active sub-sandbox's
-   * branch back. Uncommitted changes travel with the checkout as git allows;
-   * if git refuses, the error says why and nothing changes.
-   */
-  checkoutActiveBranch(step: StepReporter = () => {}): string[] {
-    const branch = this.registry.active.branch;
-    if (!this.git || !branch) {
-      throw new Error("у активной подпесочницы нет git-ветки");
-    }
-    if (this.git.currentBranch() !== branch) {
-      step(`git checkout ${branch}`);
-      this.git.checkout(branch);
-    }
-    this.branchMismatch = false;
-    return [];
-  }
+  // --- creating ------------------------------------------------------------
 
-  /** Folder a new sub-sandbox would get (placeholder names only). */
+  /** Sandbox folder a new pair would get (placeholder names only). */
   folderFor(name: string): string {
-    const safe = name.replace(/[\\/:*?"<>|\s]+/g, "-");
-    return path.join(this.config.sandboxesDir, this.transformer.anonymizePath(safe));
+    return path.join(this.config.sandboxesDir, this.transformer.anonymizePath(safeName(name)));
   }
 
-  /** Why `name` cannot be used for a new sub-sandbox, or null if it can. */
+  /** Worktree folder a new pair would get (the user's side: real names are fine). */
+  worktreeFor(name: string): string {
+    return path.join(this.config.worktreesDir, safeName(name));
+  }
+
+  /** Branches a new pair can start from: the main folder's branch first. */
+  baseBranchChoices(): string[] {
+    if (!this.git) {
+      return [];
+    }
+    const current = this.git.currentBranch();
+    const pairs = this.registry!.list().map((s) => s.branch);
+    return [...new Set([...(current ? [current] : []), ...pairs, ...this.git.listBranches()])];
+  }
+
+  /** Why `name` cannot be used for a new pair, or null if it can. */
   validateNewName(name: string): string | null {
     const n = name.trim();
     if (!this.git) {
@@ -197,240 +178,303 @@ export class Workspace {
     if (!this.git.isValidBranchName(n)) {
       return `«${n}» не подходит как имя git-ветки`;
     }
-    if (this.git.branchExists(n)) {
-      return `ветка ${n} уже существует`;
-    }
-    if (this.registry.get(n)) {
+    if (this.registry!.get(n) || this.registry!.list().some((s) => s.branch === n)) {
       return `подпесочница «${n}» уже есть`;
     }
-    const folder = this.folderFor(n);
-    if (isInside(folder, this.config.projectRoot)) {
-      return `папка ${folder} оказалась бы внутри проекта — проверьте sandboxes_dir`;
+    if (this.git.branchExists(n)) {
+      const taken = this.git.worktreeList().find((w) => w.branch === n);
+      if (taken) {
+        return `ветка ${n} уже выбрана в ${taken.path} — git не даёт выбрать одну ветку в двух папках`;
+      }
     }
-    if (fs.existsSync(folder) && fs.readdirSync(folder).length > 0) {
-      return `папка ${folder} уже существует и не пуста`;
+    const sandbox = this.folderFor(n);
+    const wtDir = this.config.worktreesDir;
+    if (isInside(sandbox, wtDir) || isInside(wtDir, sandbox)) {
+      return `папка песочницы ${sandbox} пересеклась бы с папкой worktree ${wtDir} — выберите другое имя`;
+    }
+    for (const [label, folder] of [
+      ["worktree", this.worktreeFor(n)],
+      ["песочницы", sandbox],
+    ] as const) {
+      if (isInside(folder, this.config.projectRoot)) {
+        return `папка ${label} ${folder} оказалась бы внутри проекта — проверьте sandboxes_dir / worktrees_dir`;
+      }
+      if (fs.existsSync(folder) && fs.readdirSync(folder).length > 0) {
+        return `папка ${label} ${folder} уже существует и не пуста`;
+      }
     }
     return null;
   }
 
-  /**
-   * Switch the project to `name`'s branch and make it the active sub-sandbox.
-   * Returns warnings that need the user's attention (nothing is lost).
-   */
-  switchTo(name: string, step: StepReporter = () => {}): string[] {
-    const target = this.registry.get(name);
-    if (!target) {
-      throw new Error(`нет подпесочницы «${name}»`);
-    }
-    const current = this.registry.active;
-    const warnings: string[] = [];
-
-    if (this.git && target.branch && this.git.currentBranch() !== target.branch) {
-      if (this.git.isDirty()) {
-        const label = `anonymus:${current.name}:${Date.now()}`;
-        step(`незакоммиченные изменения ветки ${current.branch ?? "?"} → git stash`);
-        try {
-          this.git.stashPush(label);
-        } catch (e) {
-          // git may have saved the stash and then failed before cleaning the
-          // working tree: the changes are still in place, so that stash is a
-          // redundant copy — remove it rather than leave it orphaned.
-          const ref = this.git.findStash(label);
-          if (ref && this.git.isDirty()) {
-            this.git.stashDrop(ref);
-          }
-          throw e;
-        }
-        current.stash = label;
-        this.registry.save();
-      }
-      step(`git checkout ${target.branch}`);
-      try {
-        this.git.checkout(target.branch);
-      } catch (e) {
-        // Put the stashed work back so the project looks exactly as before.
-        if (current.stash) {
-          const ref = this.git.findStash(current.stash);
-          if (ref) {
-            this.git.stashPop(ref);
-          }
-          current.stash = null;
-          this.registry.save();
-        }
-        throw e;
-      }
-    }
-
-    if (this.git && target.stash) {
-      step(`возвращаю незакоммиченные изменения ветки ${target.branch}`);
-      const ref = this.git.findStash(target.stash);
-      if (!ref) {
-        warnings.push(`stash ${target.stash} не найден — вероятно, его уже применили вручную`);
-        target.stash = null;
-      } else {
-        try {
-          this.git.stashPop(ref);
-          target.stash = null;
-        } catch (e) {
-          warnings.push(
-            `stash ${target.stash} применился с конфликтами — разрешите их в git; ` +
-              `сам stash сохранён (${(e as GitError).message})`
-          );
-        }
-      }
-    }
-
-    this.registry.setActive(target.name);
-    this.branchMismatch = false;
-    this.registry.save();
-    return warnings;
-  }
-
-  /** Branches a new sub-sandbox can be created from: the current one first. */
-  baseBranchChoices(): string[] {
-    const current = this.git?.currentBranch();
-    const branches = this.registry.list().map((s) => s.branch).filter((b): b is string => !!b);
-    return [...new Set([...(current ? [current] : []), ...branches])];
+  /** Does a new pair with this name reuse an existing branch? */
+  isExistingBranch(name: string): boolean {
+    return this.git?.branchExists(name.trim()) ?? false;
   }
 
   /**
-   * New branch from `from` (the current branch by default) plus a new
-   * sub-sandbox for it. With `switchTo` (default) the project switches to the
-   * new branch; without it the sub-sandbox is filled straight from the branch's
-   * commit and the project stays where it is — handy to set up several agent
-   * branches off one parent in a row.
+   * New pair: a branch (new from `from`, or an existing one that is not
+   * checked out anywhere), its worktree with the ownership mark, and an
+   * empty sandbox folder — the first scan fills it from the worktree.
    */
-  create(
-    name: string,
-    options: { from?: string; switchTo?: boolean } = {},
-    step: StepReporter = () => {}
-  ): { entry: SandboxEntry; warnings: string[]; filled: number } {
+  create(name: string, options: { from?: string } = {}, step: StepReporter = () => {}): SandboxEntry {
     const n = name.trim();
     const problem = this.validateNewName(n);
     if (problem) {
       throw new Error(problem);
     }
     const git = this.git!;
-    const from = options.from ?? git.currentBranch() ?? "HEAD";
-    if (from !== "HEAD" && !git.branchExists(from)) {
-      throw new Error(`нет ветки ${from}`);
-    }
-    const commit = git.commitOf(from);
-    step(`создаю ветку ${n} от ${from}`);
-    git.createBranch(n, from);
-    const folder = this.folderFor(n);
-    step(`создаю папку ${folder}`);
-    fs.mkdirSync(folder, { recursive: true });
-    const entry = this.registry.add({
-      name: n,
-      absPath: folder,
-      branch: n,
-      base: from === "HEAD" ? null : { branch: from, commit },
-    });
-    this.registry.save();
-
-    if (options.switchTo === false) {
-      step(`заполняю подпесочницу из ${from} (без переключения проекта)`);
-      return { entry, warnings: [], filled: this.fillFromCommit(entry, commit) };
-    }
-    return { entry, warnings: this.switchTo(n, step), filled: 0 };
-  }
-
-  /**
-   * Write the files of a commit into a sub-sandbox, anonymized, without
-   * touching the project. No sync state is recorded: when the sub-sandbox
-   * becomes active, the scan finds both sides equal and records them then.
-   */
-  private fillFromCommit(entry: SandboxEntry, commit: string): number {
-    const engine = this.engineFor(entry);
-    let count = 0;
-    for (const file of this.git!.listFiles(commit)) {
-      if (!engine.filter.isSynced(file) || engine.mapper.projectPathProblem(file)) {
-        continue;
+    let base: SandboxEntry["base"] = null;
+    let createdBranch = false;
+    if (!git.branchExists(n)) {
+      const from = options.from ?? git.currentBranch() ?? "HEAD";
+      if (from !== "HEAD" && !git.branchExists(from)) {
+        throw new Error(`нет ветки ${from}`);
       }
-      engine.writeTransformed("project", file, this.git!.readFile(commit, file));
-      count++;
+      const commit = git.commitOf(from);
+      step(`создаю ветку ${n} от ${from}`);
+      git.createBranch(n, from);
+      createdBranch = true;
+      base = from === "HEAD" ? null : { branch: from, commit };
     }
-    return count;
+    const worktree = this.worktreeFor(n);
+    step(`git worktree add ${worktree}`);
+    try {
+      fs.mkdirSync(path.dirname(worktree), { recursive: true });
+      git.worktreeAdd(worktree, n);
+    } catch (e) {
+      if (createdBranch) {
+        git.deleteBranch(n);
+      }
+      throw e;
+    }
+    const entry = this.registry!.add({
+      name: n,
+      branch: n,
+      worktree,
+      worktreeId: randomUUID(),
+      sandbox: this.folderFor(n),
+      base,
+      needsReview: false,
+      merge: null,
+    });
+    this.markWorktree(entry);
+    step(`создаю папку песочницы ${entry.sandbox}`);
+    fs.mkdirSync(entry.sandbox, { recursive: true });
+    this.registry!.save();
+    return entry;
   }
 
-  /** Commit message suggested for the active sub-sandbox's work. */
-  defaultCommitMessage(): string {
-    const active = this.registry.active;
-    return active.mergeSources?.length
-      ? `Слияние: ${active.mergeSources.join(", ")}`
-      : `Изменения подпесочницы ${active.name}`;
+  private markWorktree(entry: SandboxEntry): void {
+    const link = readWorktreeLink(entry.worktree);
+    if (link.kind !== "worktree") {
+      throw new Error(`${entry.worktree}: git не создал worktree`);
+    }
+    writeMark(link.gitDir, entry);
+  }
+
+  // --- removing ------------------------------------------------------------
+
+  /** Uncommitted files in the pair's worktree (empty when it is not ours or gone). */
+  uncommitted(name: string): string[] {
+    try {
+      return this.gitOf(name).changedFiles();
+    } catch {
+      return [];
+    }
   }
 
   /**
-   * Commit everything uncommitted on the active branch (anonymus' own files
-   * excluded). Returns false when there was nothing to commit.
-   */
-  commitActive(message = this.defaultCommitMessage()): boolean {
-    if (!this.git) {
-      throw new Error("проект не является git-репозиторием");
-    }
-    const committed = this.git.commitAll(message);
-    if (committed && this.registry.active.mergeSources) {
-      this.registry.active.mergeSources = null;
-      this.registry.save();
-    }
-    return committed;
-  }
-
-  /**
-   * Remove a sub-sandbox: its folder and sync state go to the trash, the git
-   * branch stays. The active one cannot be removed.
+   * Remove a pair. The sandbox and the sync state go to the trash, the
+   * worktree is removed with git (with `force`, its uncommitted files are
+   * copied to the trash first), the branch stays. A folder that is not the
+   * pair's worktree is never touched.
    */
   remove(
     name: string,
-    step: StepReporter = () => {},
-    options: { dropStash?: boolean } = {}
-  ): { trashDir: string; warnings: string[]; stashDropped: boolean } {
-    const entry = this.registry.get(name);
-    if (!entry) {
-      throw new Error(`нет подпесочницы «${name}»`);
-    }
-    if (entry.name === this.registry.active.name) {
-      throw new Error("активную подпесочницу удалить нельзя — сначала переключитесь на другую");
-    }
+    options: { force?: boolean } = {},
+    step: StepReporter = () => {}
+  ): { trashDir: string; warnings: string[] } {
+    const entry = this.entry(name);
+    const git = this.git!;
     const warnings: string[] = [];
-    const stamp = new Date().toISOString().replace(/T/, "_").replace(/:/g, "-").replace(/\..+$/, "");
-    const trashDir = path.join(this.config.projectRoot, SERVICE_DIR, "trash", stamp, "sandboxes");
-    fs.mkdirSync(trashDir, { recursive: true });
+    const trashDir = this.trashDirFor(entry.name);
 
-    const folder = this.registry.absPath(entry);
-    if (fs.existsSync(folder)) {
-      step(`переношу ${folder} в корзину`);
-      moveDir(folder, uniquePath(path.join(trashDir, path.basename(folder))));
-    }
-    const stateDir = path.join(this.config.projectRoot, SERVICE_DIR, "profiles", ...entry.name.split("/"));
-    if (fs.existsSync(stateDir)) {
-      moveDir(stateDir, uniquePath(path.join(trashDir, `${path.basename(folder)}.state`)));
-    }
-    let stashDropped = false;
-    if (entry.stash) {
-      const ref = this.git?.findStash(entry.stash) ?? null;
-      if (!ref) {
-        // Already gone (applied or dropped by hand): nothing to keep or remove.
-      } else if (options.dropStash) {
-        step(`удаляю stash ветки ${entry.branch}`);
-        this.git!.stashDrop(ref);
-        stashDropped = true;
-      } else {
-        warnings.push(`у ветки ${entry.branch} остался stash «${entry.stash}» — он в git stash list`);
+    const problem = checkPair(entry, this.commonGitDir!, { hasHistory: false });
+    if (!problem || problem.code === "wrong-branch") {
+      const wtGit = new Git(entry.worktree);
+      const dirty = wtGit.changedFiles();
+      if (dirty.length > 0 && !options.force) {
+        throw new Error(
+          `в worktree ${entry.worktree} незакоммиченные изменения (${dirty.length}) — ` +
+            "закоммитьте их (k) или удалите принудительно"
+        );
       }
+      for (const file of dirty) {
+        const from = path.join(entry.worktree, ...file.split("/"));
+        if (fs.existsSync(from) && fs.statSync(from).isFile()) {
+          const to = path.join(trashDir, "worktree", ...file.split("/"));
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          fs.copyFileSync(from, to);
+        }
+      }
+      step(`git worktree remove ${entry.worktree}`);
+      git.worktreeRemove(entry.worktree, dirty.length > 0);
+    } else if (problem.code === "worktree-missing" || problem.code === "sandbox-missing") {
+      git.worktreePrune();
+    } else {
+      warnings.push(`папка ${entry.worktree} не тронута: это не worktree подпесочницы (${problem.message})`);
     }
-    this.registry.remove(entry.name);
-    this.registry.save();
-    return { trashDir, warnings, stashDropped };
+
+    if (fs.existsSync(entry.sandbox)) {
+      step(`переношу ${entry.sandbox} в корзину`);
+      moveDir(entry.sandbox, uniquePath(path.join(trashDir, path.basename(entry.sandbox))));
+    }
+    this.discardState(entry.name, trashDir);
+    this.registry!.remove(entry.name);
+    this.registry!.save();
+    return { trashDir, warnings };
   }
 
-  /** Does this sub-sandbox have stashed uncommitted work that still exists in git? */
-  hasStash(name: string): boolean {
-    const entry = this.registry.get(name);
-    return !!(entry?.stash && this.git?.findStash(entry.stash));
+  // --- recovering from a problem --------------------------------------------
+
+  /**
+   * The worktree is gone or replaced: create it again at its path from the
+   * pair's branch. Whatever is in that folder now goes to the trash first.
+   * Its uncommitted work is lost while the sandbox may still have it, so the
+   * old sync history is dropped and the pair waits for a review.
+   */
+  recreateWorktree(name: string, step: StepReporter = () => {}): void {
+    const entry = this.entry(name);
+    const git = this.git!;
+    if (!git.branchExists(entry.branch)) {
+      throw new Error(`ветки ${entry.branch} больше нет — пересоздать worktree не из чего`);
+    }
+    const trashDir = this.trashDirFor(entry.name);
+    if (fs.existsSync(entry.worktree)) {
+      step(`переношу ${entry.worktree} в корзину`);
+      moveDir(entry.worktree, uniquePath(path.join(trashDir, "worktree")));
+    }
+    git.worktreePrune();
+    const taken = git.worktreeList().find((w) => w.branch === entry.branch);
+    if (taken) {
+      throw new Error(`ветка ${entry.branch} выбрана в ${taken.path} — освободите её там`);
+    }
+    step(`git worktree add ${entry.worktree} ${entry.branch}`);
+    fs.mkdirSync(path.dirname(entry.worktree), { recursive: true });
+    git.worktreeAdd(entry.worktree, entry.branch);
+    entry.worktreeId = randomUUID();
+    this.markWorktree(entry);
+    this.requireReview(entry, trashDir);
   }
+
+  /**
+   * The user confirms that the folder IS the pair's worktree (e.g. they
+   * re-created it themselves): mark it as ours. It must be a worktree of this
+   * repository on the pair's branch. Waits for a review like recreateWorktree.
+   */
+  relink(name: string): void {
+    const entry = this.entry(name);
+    const link = readWorktreeLink(entry.worktree);
+    if (link.kind !== "worktree" || !isInside(link.gitDir, path.join(this.commonGitDir!, "worktrees"))) {
+      throw new Error(`${entry.worktree} — не worktree этого репозитория, привязать нельзя`);
+    }
+    const branch = new Git(entry.worktree).currentBranch();
+    if (branch !== entry.branch) {
+      throw new Error(`в ${entry.worktree} выбрана ${branch ?? "отделённая HEAD"}, а нужна ветка ${entry.branch}`);
+    }
+    entry.worktreeId = randomUUID();
+    writeMark(link.gitDir, entry);
+    this.requireReview(entry, this.trashDirFor(entry.name));
+  }
+
+  /** The worktree was moved with `git worktree move`: where it is now, if found. */
+  movedTo(name: string): string | null {
+    const entry = this.entry(name);
+    const found = findMarkedWorktree(this.commonGitDir!, entry.worktreeId);
+    return found && path.resolve(found) !== path.resolve(entry.worktree) ? found : null;
+  }
+
+  /** Follow a worktree moved with `git worktree move` (same worktree, same mark). */
+  relocate(name: string): string {
+    const entry = this.entry(name);
+    const found = this.movedTo(name);
+    if (!found) {
+      throw new Error("worktree с меткой этой подпесочницы не найден");
+    }
+    entry.worktree = found;
+    this.registry!.save();
+    return found;
+  }
+
+  /** Someone checked out another branch inside the worktree: put the pair's branch back. */
+  checkoutBack(name: string): void {
+    const entry = this.entry(name);
+    new Git(entry.worktree).checkout(entry.branch);
+  }
+
+  /**
+   * The sandbox folder vanished: start it over empty. The old sync history
+   * no longer describes anything, so it goes to the trash; the next scan
+   * fills the sandbox from the worktree.
+   */
+  refillSandbox(name: string): void {
+    if (!this.registry) {
+      this.discardState(PLAIN_PAIR, this.trashDirFor(PLAIN_PAIR));
+      fs.mkdirSync(this.config.profile.sandboxRoot, { recursive: true });
+      return;
+    }
+    const entry = this.entry(name);
+    this.discardState(entry.name, this.trashDirFor(entry.name));
+    fs.mkdirSync(entry.sandbox, { recursive: true });
+  }
+
+  /** The user reconciled a pair that was waiting for a review. */
+  markReviewed(name: string): void {
+    const entry = this.registry?.get(name);
+    if (entry?.needsReview) {
+      entry.needsReview = false;
+      this.registry!.save();
+    }
+  }
+
+  private requireReview(entry: SandboxEntry, trashDir: string): void {
+    this.discardState(entry.name, trashDir);
+    entry.needsReview = true;
+    this.registry!.save();
+  }
+
+  // --- committing ----------------------------------------------------------
+
+  defaultCommitMessage(name: string): string {
+    return `Изменения подпесочницы ${name}`;
+  }
+
+  /** Commit everything uncommitted in the pair's worktree. False when there was nothing. */
+  commit(name: string, message = this.defaultCommitMessage(name)): boolean {
+    if (!this.git) {
+      throw new Error("проект не является git-репозиторием");
+    }
+    return this.gitOf(name).commitAll(message);
+  }
+
+  // --- helpers ---------------------------------------------------------------
+
+  private trashDirFor(name: string): string {
+    return path.join(this.config.projectRoot, SERVICE_DIR, "trash", trashStamp(), ...name.split("/"));
+  }
+
+  /** Move a pair's sync state (history and merge bases) to the trash. */
+  private discardState(name: string, trashDir: string): void {
+    const stateDir = path.join(this.config.projectRoot, SERVICE_DIR, "profiles", ...name.split("/"));
+    if (fs.existsSync(stateDir)) {
+      moveDir(stateDir, uniquePath(path.join(trashDir, "state")));
+    }
+  }
+}
+
+/** A pair name as a folder name. */
+function safeName(name: string): string {
+  return name.replace(/[\\/:*?"<>|\s]+/g, "-");
 }
 
 function uniquePath(p: string): string {

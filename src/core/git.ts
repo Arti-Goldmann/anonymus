@@ -32,12 +32,13 @@ export function gitBusy(gitDir: string): boolean {
   return fs.existsSync(path.join(gitDir, "index.lock"));
 }
 
-/** Paths anonymus itself writes in the project; they never make it "dirty". */
+/** Paths anonymus itself writes in the main project; they never make it "dirty". */
 const OWN_PATHS = [`${SERVICE_DIR}/`, "anonymus.yaml", ".anonymus.yaml"];
 
 /**
- * Thin wrapper over the git CLI for the project folder. Only what the
- * sub-sandbox workflow needs: branches, checkout and per-branch stashes.
+ * Thin wrapper over the git CLI for one folder (the main project or one of
+ * its worktrees). Only what the sub-sandbox workflow needs: branches,
+ * worktrees, commits and merges.
  */
 export class Git {
   constructor(readonly cwd: string) {}
@@ -113,6 +114,16 @@ export class Git {
     this.run(from ? ["branch", name, from] : ["branch", name]);
   }
 
+  /** Delete a branch (used to undo a branch created for a pair that failed to set up). */
+  deleteBranch(name: string): void {
+    this.run(["branch", "--quiet", "-D", name]);
+  }
+
+  /** Local branch names. */
+  listBranches(): string[] {
+    return this.run(["for-each-ref", "--format=%(refname:short)", "refs/heads/"]).split("\n").filter(Boolean);
+  }
+
   /** Commit id a ref points to. */
   commitOf(ref: string): string {
     return this.run(["rev-parse", "--verify", `${ref}^{commit}`]);
@@ -152,7 +163,7 @@ export class Git {
 
   /**
    * Pathspec arguments that keep anonymus' own config / service folder out of
-   * `stash` / `add`. Paths already in .gitignore are left out: git skips them
+   * `add`. Paths already in .gitignore are left out: git skips them
    * anyway and refuses ("paths are ignored") when they are named explicitly.
    * Returns [] when nothing needs excluding — then no pathspec is passed at all.
    */
@@ -177,39 +188,127 @@ export class Git {
 
   /** Uncommitted changes (tracked or untracked), ignoring anonymus' own files. */
   isDirty(): boolean {
-    const lines = this.run(["status", "--porcelain", "--untracked-files=all"]).split("\n").filter(Boolean);
-    return lines.some((line) => {
-      const file = line.slice(3).replace(/^"|"$/g, "");
-      return !OWN_PATHS.some((own) => file === own || file.startsWith(own));
-    });
+    return this.changedFiles().length > 0;
+  }
+
+  /** Paths (POSIX, relative to this folder) with uncommitted changes, own files excluded. */
+  changedFiles(): string[] {
+    // -z: NUL-separated, no quoting of non-ASCII names; renames are not reported
+    // without --find-renames, so every record is "XY path".
+    const records = this.exec(["status", "--porcelain", "-z", "--untracked-files=all"])
+      .toString("utf8")
+      .split("\0")
+      .filter(Boolean);
+    return records
+      .map((r) => r.slice(3))
+      .filter((file) => !OWN_PATHS.some((own) => file === own || file.startsWith(own)));
+  }
+
+  // --- worktrees -----------------------------------------------------------
+
+  /** The repository's shared .git folder (the same for all its worktrees). */
+  commonGitDir(): string {
+    return path.resolve(this.cwd, this.run(["rev-parse", "--git-common-dir"]));
+  }
+
+  /** New worktree at `dir` with `branch` checked out (the branch must exist). */
+  worktreeAdd(dir: string, branch: string): void {
+    this.run(["worktree", "add", "--quiet", dir, branch]);
+  }
+
+  /** Remove a worktree; `force` also discards its uncommitted changes. */
+  worktreeRemove(dir: string, force = false): void {
+    this.run(["worktree", "remove", ...(force ? ["--force"] : []), dir]);
+  }
+
+  /** Forget worktrees whose folders are gone. */
+  worktreePrune(): void {
+    this.run(["worktree", "prune"]);
+  }
+
+  /** All worktrees of the repository (the main folder first). */
+  worktreeList(): { path: string; branch: string | null; prunable: boolean }[] {
+    const out: { path: string; branch: string | null; prunable: boolean }[] = [];
+    for (const block of this.run(["worktree", "list", "--porcelain"]).split(/\n\n+/)) {
+      const lines = block.split("\n");
+      const wt = lines.find((l) => l.startsWith("worktree "));
+      if (!wt) continue;
+      const branch = lines.find((l) => l.startsWith("branch "))?.slice("branch refs/heads/".length) ?? null;
+      out.push({ path: path.resolve(wt.slice("worktree ".length)), branch, prunable: lines.some((l) => l.startsWith("prunable")) });
+    }
+    return out;
+  }
+
+  // --- merging -------------------------------------------------------------
+
+  /** A merge was started and is not committed or aborted yet. */
+  mergeInProgress(): boolean {
+    try {
+      this.run(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
-   * Stash everything uncommitted (including untracked files) under `label`,
-   * except anonymus' own config and service folder — they must stay in place
-   * while branches are switched.
+   * `git merge --no-ff` of `branch` into the checked-out branch. On conflicts
+   * the merge stays in progress and the conflicted paths are returned.
    */
-  stashPush(label: string): void {
-    this.run(["stash", "push", "--include-untracked", "--message", label, ...this.ownExcludes()]);
-  }
-
-  /** `stash@{n}` of the newest stash whose message contains `label`, if any. */
-  findStash(label: string): string | null {
-    const list = this.run(["stash", "list", "--format=%gd%x09%s"]);
-    for (const line of list.split("\n")) {
-      const [ref, subject] = line.split("\t");
-      if (ref && subject?.includes(label)) {
-        return ref;
+  merge(branch: string, message: string): { ok: true } | { ok: false; conflicts: string[] } {
+    try {
+      this.run(["merge", "--no-ff", "--no-edit", "--message", message, branch]);
+      return { ok: true };
+    } catch (e) {
+      const conflicts = this.mergeInProgress() ? this.conflictedFiles() : [];
+      if (conflicts.length === 0) {
+        throw e; // refused before merging (e.g. local changes would be overwritten)
       }
+      return { ok: false, conflicts };
     }
-    return null;
   }
 
-  stashPop(ref: string): void {
-    this.run(["stash", "pop", "--quiet", ref]);
+  /** Paths with unresolved merge conflicts. */
+  conflictedFiles(): string[] {
+    return this.exec(["diff", "--name-only", "-z", "--diff-filter=U"]).toString("utf8").split("\0").filter(Boolean);
   }
 
-  stashDrop(ref: string): void {
-    this.run(["stash", "drop", "--quiet", ref]);
+  /** Finish a merge in progress: stage everything (own files excluded) and commit. */
+  commitMerge(): void {
+    this.run(["add", "--all", ...this.ownExcludes()]);
+    this.run(["commit", "--quiet", "--no-edit"]);
+  }
+
+  mergeAbort(): void {
+    this.run(["merge", "--abort"]);
+  }
+}
+
+/** Contents of the `.git` file of a worktree: where its git folder is. */
+export type WorktreeLink =
+  | { kind: "missing" } // no .git at all
+  | { kind: "repository" } // .git is a folder: a separate clone / main repo, not a worktree
+  | { kind: "worktree"; gitDir: string };
+
+/**
+ * Read `<dir>/.git` without running git (cheap enough to poll every second).
+ * A linked worktree has a FILE `gitdir: <repo>/.git/worktrees/<id>`.
+ */
+export function readWorktreeLink(dir: string): WorktreeLink {
+  const dotGit = path.join(dir, ".git");
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(dotGit);
+  } catch {
+    return { kind: "missing" };
+  }
+  if (stat.isDirectory()) {
+    return { kind: "repository" };
+  }
+  try {
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, "utf8"));
+    return m ? { kind: "worktree", gitDir: path.resolve(dir, m[1]) } : { kind: "missing" };
+  } catch {
+    return { kind: "missing" };
   }
 }

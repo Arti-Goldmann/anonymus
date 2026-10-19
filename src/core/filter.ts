@@ -5,11 +5,14 @@ import { SERVICE_DIR, type SyncRules } from "../config/schema.js";
 // NodeNext the typings expose it as `.default` (which also exists at runtime).
 const ignore = ignoreModule.default;
 
-/** Folder in a sub-sandbox with prepared merge patches (see core/mergePrep.ts). */
+/** Folder in a sub-sandbox with merge notes for the agent (see core/gitMerge.ts). */
 export const MERGE_DIR = ".anonymus-merge";
 
-/** Never synced, whatever the config says. */
-const ALWAYS_EXCLUDED = [".git/", `${SERVICE_DIR}/`, `${MERGE_DIR}/`, "anonymus.yaml", ".anonymus.yaml"];
+/**
+ * Never synced, whatever the config says. `.git` without a slash: in a git
+ * worktree it is a FILE pointing to the repository, not a folder.
+ */
+const ALWAYS_EXCLUDED = [".git", `${SERVICE_DIR}/`, `${MERGE_DIR}/`, "anonymus.yaml", ".anonymus.yaml"];
 
 /**
  * Decides which files take part in the sync. All patterns use `.gitignore`

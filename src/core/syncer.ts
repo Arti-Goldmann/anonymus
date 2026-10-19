@@ -2,8 +2,9 @@ import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { watch, type FSWatcher } from "chokidar";
 import type { FileStatus, SyncEngine, TransferResult } from "./engine.js";
-import { Git, gitBusy, readHeadBranch } from "./git.js";
+import { gitBusy } from "./git.js";
 import { mergeInEditor } from "./merge.js";
+import type { PairProblem } from "./pairGuard.js";
 import { toPosixRelative, type Side } from "./paths.js";
 
 export type SyncEventKind =
@@ -23,50 +24,60 @@ export interface SyncEvent {
   message: string;
   canonical?: string;
   replacements?: number;
+  /** Pair the event belongs to (set by the caller that runs several pairs). */
+  pair?: string;
 }
 
 export type Resolution = "project" | "sandbox" | "editor";
-
-/** The project's branch was switched outside anonymus while syncing. */
-export interface BranchChange {
-  /** Branch of the active sub-sandbox. */
-  expected: string;
-  /** Branch now checked out; null for a detached HEAD. */
-  actual: string | null;
-}
 
 interface SyncerEvents {
   event: [SyncEvent];
   held: [FileStatus[]];
   state: [{ paused: boolean; busy: boolean; pending: number }];
-  branch: [BranchChange];
+  blocked: [PairProblem];
+}
+
+export interface SyncerOptions {
+  /**
+   * Is it safe to sync this pair? Called once a second and before every file.
+   * A problem stops the syncer for good (see core/pairGuard.ts).
+   */
+  guard?: () => PairProblem | null;
+  /** Git folder of the worktree: while git holds its index.lock nothing is applied. */
+  gitDir?: string | null;
+  /** Mass-deletion stop (default on); off for one run after the user confirmed. */
+  massDeleteGuard?: boolean;
 }
 
 const MAX_RETRIES = 5;
-/** How often .git/HEAD is checked while idle (every batch checks it too). */
-const BRANCH_POLL_MS = 1000;
-/** Retry delay while another git command holds .git/index.lock. */
+/** How often the guard runs while idle (every applied file checks it too). */
+const GUARD_POLL_MS = 1000;
+/** Retry delay while another git command holds index.lock. */
 const GIT_WAIT_MS = 200;
 /** After this long behind index.lock, say in the log why nothing moves. */
 const GIT_WAIT_REPORT_MS = 5000;
+/** Deletions on one side within this window count as one wave. */
+const MASS_DELETE_WINDOW_MS = 10_000;
+/** A wave larger than max(MIN, SHARE × files of the pair) stops the pair. */
+const MASS_DELETE_MIN = 5;
+const MASS_DELETE_SHARE = 0.25;
 
 /**
- * Live two-way sync. Watcher events only mark a canonical path as dirty; a
- * single worker then looks at what is actually on disk (SyncEngine.classify)
- * and acts. Because every decision comes from content + the sync record, our
- * own writes produce events that classify as "synced" and are dropped — no
- * echo loop, no timing heuristics.
+ * Live two-way sync of one pair. Watcher events only mark a canonical path as
+ * dirty; a single worker then looks at what is actually on disk
+ * (SyncEngine.classify) and acts. Because every decision comes from content +
+ * the sync record, our own writes produce events that classify as "synced"
+ * and are dropped — no echo loop, no timing heuristics.
  *
  * Files that need a human (conflicts, unknown differences) are "held": they
  * are not touched automatically until resolved.
  *
- * Branch guard: a sub-sandbox belongs to one branch. A `git checkout` done
- * outside anonymus rewrites the project, and the watcher would copy the other
- * branch into this sandbox. So HEAD is checked every second and before every
- * file; while git holds the index (a checkout in progress) nothing is applied.
- * Once HEAD differs, sync stops for good: queued events are dropped (they come
- * from the checkout, not from edits) and `branch` is emitted. The caller
- * decides what to do and starts a new Syncer.
+ * Safety: the guard (is this still the pair's own worktree, on its branch,
+ * with its sandbox?) runs every second and before every file. A worktree
+ * removed or re-created by git, a checkout inside it, a vanished sandbox —
+ * any of these stops the syncer for good: queued events are dropped (they
+ * come from the removal / checkout, not from edits) and `blocked` is emitted.
+ * A wave of deletions on one side stops it the same way, before it spreads.
  */
 export class Syncer extends EventEmitter<SyncerEvents> {
   private watchers: FSWatcher[] = [];
@@ -78,29 +89,29 @@ export class Syncer extends EventEmitter<SyncerEvents> {
   private running = false;
   private paused = false;
   private stopped = false;
-  /** .git folder of the project, when the profile is tied to a branch. */
-  private gitDir: string | null = null;
-  private branchTimer: NodeJS.Timeout | null = null;
-  private branchChange: BranchChange | null = null;
+  private guardTimer: NodeJS.Timeout | null = null;
+  private problem: PairProblem | null = null;
   private gitBusySince = 0;
+  /** Recent deletions, by the side the files vanished on. */
+  private readonly deletions: Record<Side, number[]> = { project: [], sandbox: [] };
+  /** Largest number of files the pair had (deletions shrink the state). */
+  private knownFiles: number;
 
-  constructor(private readonly engine: SyncEngine, initiallyHeld: FileStatus[] = []) {
+  constructor(
+    private readonly engine: SyncEngine,
+    initiallyHeld: FileStatus[] = [],
+    private readonly options: SyncerOptions = {}
+  ) {
     super();
     for (const s of initiallyHeld) {
       this.held.set(s.canonical, s);
     }
-    if (engine.config.profile.branch) {
-      try {
-        this.gitDir = new Git(engine.projectRoot).gitDir();
-      } catch {
-        // Not a git repo (or no git): nothing to guard.
-      }
-    }
+    this.knownFiles = engine.state.size;
   }
 
-  /** Set once the branch was switched outside anonymus; sync stays stopped. */
-  getBranchChange(): BranchChange | null {
-    return this.branchChange;
+  /** Set once the pair became unsafe to sync; the syncer stays stopped. */
+  getProblem(): PairProblem | null {
+    return this.problem;
   }
 
   getHeld(): FileStatus[] {
@@ -111,14 +122,24 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     return this.paused;
   }
 
+  /** Nothing queued, nothing running: both sides agree as far as the syncer knows. */
+  isIdle(): boolean {
+    return !this.running && this.dirty.size === 0 && this.timer === null;
+  }
+
   async start(): Promise<void> {
-    if (this.gitDir) {
-      this.checkBranch();
-      this.branchTimer = setInterval(() => this.checkBranch(), BRANCH_POLL_MS);
-      this.branchTimer.unref();
+    if (!this.checkGuard()) {
+      return;
+    }
+    if (this.options.guard) {
+      this.guardTimer = setInterval(() => this.checkGuard(), GUARD_POLL_MS);
+      this.guardTimer.unref();
     }
     const ready = (["project", "sandbox"] as Side[]).map((side) => this.watchSide(side));
     await Promise.all(ready);
+    if (this.problem || this.stopped) {
+      return;
+    }
     this.info("слежу за изменениями в проекте и песочнице");
     // Catch anything that changed between the scan and the watchers going up.
     this.rescan();
@@ -128,10 +149,9 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     this.stopped = true;
     if (this.timer) {
       clearTimeout(this.timer);
+      this.timer = null;
     }
-    if (this.branchTimer) {
-      clearInterval(this.branchTimer);
-    }
+    this.stopGuard();
     await Promise.all(this.watchers.map((w) => w.close()));
     this.watchers = [];
     this.engine.flush();
@@ -150,7 +170,7 @@ export class Syncer extends EventEmitter<SyncerEvents> {
 
   /** Re-check every known and present file. */
   rescan(): void {
-    if (this.branchChange) {
+    if (this.problem || !this.checkGuard()) {
       return;
     }
     const { canonicals, pathErrors } = this.engine.listCandidates();
@@ -212,7 +232,7 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     const onDirRemoved = (abs: string) => {
       const rel = toPosixRelative(root, abs);
       for (const key of this.engine.state.keys()) {
-        if (this.engine.mapper.sidePath(side, key).startsWith(rel + "/")) {
+        if (rel === "" || this.engine.mapper.sidePath(side, key).startsWith(rel + "/")) {
           this.markDirty(key);
         }
       }
@@ -225,15 +245,15 @@ export class Syncer extends EventEmitter<SyncerEvents> {
   }
 
   private markDirty(canonical: string): void {
-    if (this.branchChange) {
-      return; // after a foreign checkout every change is suspect
+    if (this.problem || this.stopped) {
+      return; // after a removal / checkout every change is suspect
     }
     this.dirty.add(canonical);
     this.schedule();
   }
 
   private schedule(delay = this.engine.config.sync.debounceMs): void {
-    if (this.stopped || this.paused || this.branchChange || this.timer) {
+    if (this.stopped || this.paused || this.problem || this.timer) {
       this.emitState();
       return;
     }
@@ -253,8 +273,8 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     let gitWait = false;
     try {
       while (this.dirty.size > 0 && !this.paused && !this.stopped) {
-        // Checked per file: a checkout may start in the middle of a batch.
-        const gate = this.gitGate();
+        // Checked per file: a removal or checkout may start in the middle of a batch.
+        const gate = this.gate();
         if (gate !== "ok") {
           gitWait = gate === "wait";
           break;
@@ -276,20 +296,21 @@ export class Syncer extends EventEmitter<SyncerEvents> {
   }
 
   /**
-   * May files be applied now? "blocked" — the branch changed; "wait" — a git
-   * command holds the index (a checkout writes files before it moves HEAD).
+   * May files be applied now? "blocked" — the pair is unsafe; "wait" — a git
+   * command holds the index (a checkout or merge writes files before it ends).
    */
-  private gitGate(): "ok" | "wait" | "blocked" {
-    if (!this.checkBranch()) {
+  private gate(): "ok" | "wait" | "blocked" {
+    if (!this.checkGuard()) {
       return "blocked";
     }
-    if (this.gitDir && gitBusy(this.gitDir)) {
+    const gitDir = this.options.gitDir;
+    if (gitDir && gitBusy(gitDir)) {
       const now = Date.now();
       if (this.gitBusySince === 0) {
         this.gitBusySince = now;
       } else if (this.gitBusySince > 0 && now - this.gitBusySince > GIT_WAIT_REPORT_MS) {
         this.gitBusySince = -1; // reported
-        this.info("git занят (.git/index.lock) — синхронизация ждёт; если git не запущен, удалите этот файл");
+        this.info("git занят (index.lock) — синхронизация ждёт; если git не запущен, удалите этот файл");
       }
       return "wait";
     }
@@ -297,40 +318,68 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     return "ok";
   }
 
-  /** Compare HEAD with the profile's branch; false once they differ. */
-  private checkBranch(): boolean {
-    const expected = this.engine.config.profile.branch;
-    if (!this.gitDir || !expected) {
-      return true;
-    }
-    const actual = readHeadBranch(this.gitDir);
-    if (actual === undefined) {
-      return !this.branchChange;
-    }
-    if (this.branchChange) {
-      if (actual !== this.branchChange.actual) {
-        this.branchChange = { expected, actual };
-        this.emit("branch", this.branchChange);
-      }
+  /** Run the guard; false (and stopped for good) once the pair is unsafe. */
+  private checkGuard(): boolean {
+    if (this.problem) {
       return false;
     }
-    if (actual === expected) {
-      return true;
+    const problem = this.options.guard?.() ?? null;
+    if (problem) {
+      this.block(problem);
+      return false;
     }
-    this.branchChange = { expected, actual };
+    return true;
+  }
+
+  private block(problem: PairProblem): void {
+    if (this.problem) {
+      return;
+    }
+    this.problem = problem;
     this.dirty.clear();
     this.retries.clear();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    this.emitEvent(
-      "error",
-      `ветка сменилась вне anonymus: ${expected} → ${actual ?? "отделённый HEAD"} — синхронизация остановлена`
-    );
-    this.emit("branch", this.branchChange);
+    this.stopGuard();
+    this.emitEvent("error", `${problem.message} — синхронизация остановлена`);
+    this.emit("blocked", problem);
     this.emitState();
-    return false;
+  }
+
+  private stopGuard(): void {
+    if (this.guardTimer) {
+      clearInterval(this.guardTimer);
+      this.guardTimer = null;
+    }
+  }
+
+  /**
+   * Count a deletion that vanished on `side`; false (pair stopped) when it
+   * would make the current wave too big to be an ordinary edit.
+   */
+  private allowDeletion(side: Side): boolean {
+    if (this.options.massDeleteGuard === false) {
+      return true;
+    }
+    const now = Date.now();
+    const recent = this.deletions[side].filter((t) => now - t < MASS_DELETE_WINDOW_MS);
+    this.knownFiles = Math.max(this.knownFiles, this.engine.state.size);
+    const limit = Math.max(MASS_DELETE_MIN, Math.ceil(this.knownFiles * MASS_DELETE_SHARE));
+    if (recent.length >= limit) {
+      const where = side === "project" ? "в worktree проекта" : "в песочнице";
+      this.block({
+        code: "mass-delete",
+        side,
+        count: recent.length + 1 + this.dirty.size,
+        message: `${where} разом исчезло больше ${limit} файлов — удаления не перенесены на другую сторону`,
+      });
+      return false;
+    }
+    recent.push(now);
+    this.deletions[side] = recent;
+    return true;
   }
 
   private processOne(canonical: string): void {
@@ -373,10 +422,14 @@ export class Syncer extends EventEmitter<SyncerEvents> {
         this.reportTransfer(this.engine.copy("sandbox", c));
         return;
       case "deleted-in-sandbox":
-        this.reportDelete("project", c);
+        if (this.allowDeletion("sandbox")) {
+          this.reportDelete("project", c);
+        }
         return;
       case "deleted-in-project":
-        this.reportDelete("sandbox", c);
+        if (this.allowDeletion("project")) {
+          this.reportDelete("sandbox", c);
+        }
         return;
       case "both-changed": {
         if (!status.deletedOn && !status.binary) {
@@ -432,8 +485,8 @@ export class Syncer extends EventEmitter<SyncerEvents> {
 
   /** Resolve a held file by the user's choice. */
   async resolve(canonical: string, how: Resolution): Promise<{ ok: boolean; message: string }> {
-    if (this.branchChange) {
-      return { ok: false, message: "ветка проекта сменилась вне anonymus — сначала выберите, что делать" };
+    if (this.problem || !this.checkGuard()) {
+      return { ok: false, message: `${this.problem?.message ?? "пара недоступна"} — сначала разберитесь с этим` };
     }
     const status = this.engine.classify(canonical);
     try {
@@ -446,7 +499,7 @@ export class Syncer extends EventEmitter<SyncerEvents> {
         const t = this.engine.transformer;
         const base = this.engine.baseText(canonical);
         const result = await mergeInEditor({
-          projectRoot: this.engine.projectRoot,
+          projectRoot: this.engine.serviceRoot,
           canonical,
           ours: this.engine.decodeSide("project", p).text,
           theirs: t.deanonymize(this.engine.decodeSide("sandbox", s).text).text,
@@ -454,6 +507,9 @@ export class Syncer extends EventEmitter<SyncerEvents> {
         });
         if (!result.ok) {
           return { ok: false, message: result.reason };
+        }
+        if (!this.checkGuard()) {
+          return { ok: false, message: `${this.problem!.message} — результат слияния не записан` };
         }
         this.reportTransfer(this.engine.writeResolved(canonical, result.text), "resolved");
       } else {
@@ -485,7 +541,7 @@ export class Syncer extends EventEmitter<SyncerEvents> {
       this.emitEvent("warning", `${shown}: ${w}`, r.canonical);
     }
     if (r.backup) {
-      this.emitEvent("info", `прежняя версия сохранена: ${path.relative(this.engine.projectRoot, r.backup)}`, r.canonical);
+      this.emitEvent("info", `прежняя версия сохранена: ${path.relative(this.engine.serviceRoot, r.backup)}`, r.canonical);
     }
   }
 

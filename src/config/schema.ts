@@ -40,33 +40,40 @@ export interface SyncRules {
 }
 
 /**
- * One sandbox paired with the project. Each profile ("sub-sandbox") belongs to
- * one git branch of the project; only the active profile is synced, switching
- * checks its branch out (see core/workspace.ts).
+ * One sync pair. In a git project every sub-sandbox is paired with its own
+ * git worktree of the project (see core/workspace.ts) and all pairs sync at
+ * once; without git the single pair is the project folder itself.
  */
 export interface Profile {
   name: string;
   /** Absolute path of the sandbox root. */
   sandboxRoot: string;
-  /** Git branch of the main project this sandbox belongs to. */
+  /** Project side of the pair: the worktree (defaults to the main project folder). */
+  projectRoot?: string;
+  /** Git branch checked out in that worktree. */
   branch?: string;
 }
 
 export interface AnonymusConfig {
-  /** Absolute path of the main project root (the folder holding the config). */
+  /**
+   * Absolute path of the main project root: the folder holding the config and
+   * `.anonymus/` (state, trash, journal of all pairs).
+   */
   projectRoot: string;
   /** Absolute path of the config file itself. */
   configPath: string;
   profile: Profile;
   /** Folder new sub-sandboxes are created in. */
   sandboxesDir: string;
+  /** Folder the git worktrees of sub-sandboxes are created in (outside the project). */
+  worktreesDir: string;
   sync: SyncRules;
   replacements: ReplacementRule[];
 }
 
 export const CONFIG_FILENAMES = ["anonymus.yaml", ".anonymus.yaml"] as const;
 
-/** Service directory inside the project root (state, trash, merge files). */
+/** Service directory inside the main project root (state, trash, merge files). */
 export const SERVICE_DIR = ".anonymus";
 
 export const DEFAULT_BINARY: string[] = [

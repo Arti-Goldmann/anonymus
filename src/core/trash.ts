@@ -5,18 +5,17 @@ import { toAbsolute, type Side } from "./paths.js";
 
 /**
  * Backups of files anonymus is about to delete or overwrite. Every run gets
- * its own folder, `.anonymus/trash/<timestamp>/<project|sandbox>/<path>`, in
- * the project (sandbox copies are already anonymized, so nothing leaks).
+ * its own folder, `.anonymus/trash/<timestamp>/<pair>/<project|sandbox>/<path>`,
+ * in the main project (sandbox copies are already anonymized, so nothing leaks).
  */
 export class Trash {
   readonly root: string;
   readonly sessionDir: string;
   private count = 0;
 
-  constructor(projectRoot: string, now = new Date()) {
-    this.root = path.join(projectRoot, SERVICE_DIR, "trash");
-    const stamp = now.toISOString().replace(/T/, "_").replace(/:/g, "-").replace(/\..+$/, "");
-    this.sessionDir = path.join(this.root, stamp);
+  constructor(serviceRoot: string, pair = "default", now = new Date()) {
+    this.root = path.join(serviceRoot, SERVICE_DIR, "trash");
+    this.sessionDir = path.join(this.root, trashStamp(now), ...pair.split("/"));
   }
 
   get backups(): number {
@@ -38,4 +37,9 @@ export class Trash {
     this.count++;
     return dest;
   }
+}
+
+/** Folder name of one session in the trash: 2026-10-19_12-30-05. */
+export function trashStamp(now = new Date()): string {
+  return now.toISOString().replace(/T/, "_").replace(/:/g, "-").replace(/\..+$/, "");
 }

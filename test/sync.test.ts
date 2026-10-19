@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { scan } from "../src/core/scanner.js";
 import { applyReconcile, planReconcile, summarize } from "../src/core/reconcile.js";
-import { Syncer, type BranchChange, type SyncEvent } from "../src/core/syncer.js";
-import { Workspace } from "../src/core/workspace.js";
+import { Syncer, type SyncEvent } from "../src/core/syncer.js";
 import { makeBench, type Bench } from "./helpers.js";
 
 /** Poll until `check` passes or time runs out. */
@@ -171,52 +170,3 @@ describe("live Syncer", () => {
   });
 });
 
-describe("live Syncer: branch switched outside anonymus", () => {
-  let bench: Bench;
-  let syncer: Syncer | null = null;
-  afterEach(async () => {
-    await syncer?.stop();
-    syncer = null;
-    bench?.cleanup();
-  });
-
-  it("stops before copying the other branch into the sub-sandbox", async () => {
-    bench = makeBench();
-    bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
-    bench.gitInit();
-    bench.git("checkout", "--quiet", "-b", "other");
-    bench.write("project", "BIGcorpProject/main.c", "int v = 2; // BIGcorpProject\n");
-    bench.write("project", "BIGcorpProject/new.c", "// only on other\n");
-    bench.git("add", "-A");
-    bench.git("commit", "--quiet", "-m", "other");
-    bench.git("checkout", "--quiet", "master");
-
-    const ws = new Workspace(bench.config());
-    ws.reconcileWithGit();
-    const e = ws.engineFor();
-    expect(e.config.profile.branch).toBe("master");
-    await applyReconcile(e, planReconcile(await scan(e), "project-wins"));
-    syncer = new Syncer(e);
-    const changes: BranchChange[] = [];
-    syncer.on("branch", (c) => changes.push(c));
-    await syncer.start();
-    await sleep(300);
-
-    // A checkout in a terminal / VS Code, not through anonymus.
-    bench.git("checkout", "--quiet", "other");
-    await waitFor(() => syncer!.getBranchChange() !== null);
-    expect(syncer.getBranchChange()).toEqual({ expected: "master", actual: "other" });
-    expect(changes).toHaveLength(1);
-
-    await sleep(800);
-    expect(bench.read("sandbox", "MyProject/main.c")).toBe("int v = 1; // MyProject\n");
-    expect(bench.exists("sandbox", "MyProject/new.c")).toBe(false);
-
-    // Nothing moves the other way either, even after "p".
-    syncer.resume();
-    bench.write("sandbox", "MyProject/main.c", "int v = 3; // MyProject\n");
-    await sleep(800);
-    expect(bench.read("project", "BIGcorpProject/main.c")).toBe("int v = 2; // BIGcorpProject\n");
-    expect((await syncer.resolve("BIGcorpProject/main.c", "sandbox")).ok).toBe(false);
-  });
-});
