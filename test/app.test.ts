@@ -7,6 +7,7 @@ import { render } from "ink";
 import { afterEach, describe, expect, it } from "vitest";
 import { Workspace } from "../src/core/workspace.js";
 import { App } from "../src/ui/App.js";
+import { mouseFilteredStdin } from "../src/ui/mouse.js";
 import { makeBench, type Bench } from "./helpers.js";
 
 class FakeStdout extends EventEmitter {
@@ -54,7 +55,7 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
     const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
     const app = render(React.createElement(App, { workspace: ws, version: "test", warnings: [] }), {
       stdout: out as never,
-      stdin: stdin as never,
+      stdin: mouseFilteredStdin(stdin),
       patchConsole: false,
       exitOnCtrlC: false,
     });
@@ -124,5 +125,27 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
     out.emit("resize");
     await until(() => out.screen.includes("▀▄ anonymus"), "compact header");
     expect(out.screen).not.toMatch(MASCOT_ROW);
+  });
+
+  it("scrolls the journal with the mouse wheel; the arrows stay with the pair list", async () => {
+    bench = makeBench();
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1;\n");
+    const { out, press } = startApp(new Workspace(bench.config()));
+    await until(() => out.screen.includes("синхронно"), "live");
+    for (let i = 0; i < 40; i++) {
+      bench.write("project", `BIGcorpProject/f${String(i).padStart(2, "0")}.c`, `int f${i};\n`);
+    }
+    await until(() => out.screen.includes("MyProject/f39.c"), "newest transfer shown");
+
+    press("\x1b[<64;5;5M\x1b[<64;5;5M"); // wheel up, two notches
+    await until(() => out.screen.includes("журнал: история"), "scrolled back");
+    expect(out.screen).not.toContain("MyProject/f39.c");
+    press("\x1b[B"); // an arrow key does not scroll
+    await new Promise((r) => setTimeout(r, 200));
+    expect(out.screen).toContain("журнал: история");
+
+    press("\x1b[<65;5;5M\x1b[<65;5;5M"); // wheel down back to the newest lines
+    await until(() => out.screen.includes("MyProject/f39.c"), "back at the newest");
+    expect(out.screen).not.toContain("журнал: история");
   });
 });

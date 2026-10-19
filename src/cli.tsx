@@ -16,6 +16,7 @@ import { Syncer } from "./core/syncer.js";
 import { Workspace } from "./core/workspace.js";
 import { App } from "./ui/App.js";
 import { flickerFreeStdout } from "./ui/frameStdout.js";
+import { MOUSE_OFF, MOUSE_ON, mouseFilteredStdin } from "./ui/mouse.js";
 import { formatTime } from "./ui/theme.js";
 
 const HELP = `anonymus — автоматическая синхронизация проекта и песочниц с анонимизацией
@@ -443,19 +444,22 @@ async function main(): Promise<void> {
   const leaveAltScreen = () => {
     if (onAltScreen) {
       onAltScreen = false;
-      // Back to the normal screen; an empty title lets the terminal show its own again.
-      process.stdout.write("\x1b[?1049l" + terminalTitle(""));
+      // Mouse reporting off, back to the normal screen; an empty title lets the
+      // terminal show its own again.
+      process.stdout.write(MOUSE_OFF + "\x1b[?1049l" + terminalTitle(""));
     }
   };
   // Tab title: "🎭 anonymus · <project>" (Windows Terminal shows it as is; VS Code
   // shows it with terminal.integrated.tabs.title set to "${sequence}").
   process.title = "anonymus";
   process.stdout.write(terminalTitle(`🎭 anonymus · ${path.basename(workspace.config.projectRoot)}`));
-  process.stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
+  // Mouse reporting on: the wheel scrolls the journal instead of acting as ↑ / ↓ (see ui/mouse.ts).
+  process.stdout.write("\x1b[?1049h\x1b[2J\x1b[H" + MOUSE_ON);
   process.on("exit", leaveAltScreen);
 
   const app = render(<App workspace={workspace} version={version()} warnings={warnings} />, {
     stdout: flickerFreeStdout(process.stdout),
+    stdin: mouseFilteredStdin(process.stdin),
     exitOnCtrlC: false,
     patchConsole: false,
   });

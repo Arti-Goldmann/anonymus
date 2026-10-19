@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import Spinner from "ink-spinner";
 import TextInput from "ink-text-input";
 import { defaultMergeSources } from "../core/mergePrep.js";
 import type { PairProblem, ProblemCode } from "../core/pairGuard.js";
 import type { SyncEvent } from "../core/syncer.js";
+import { mouseBus } from "./mouse.js";
 import type { Workspace } from "../core/workspace.js";
 import { EventLine } from "./EventLine.js";
 import type { ActionResult, PairView } from "./pairState.js";
@@ -18,6 +19,9 @@ type Mode =
   | { kind: "merge"; target: string; sources: string[]; picked: Set<string>; index: number }
   | { kind: "commit"; name: string; value: string }
   | { kind: "busy"; text: string };
+
+/** Journal lines per wheel notch. */
+const WHEEL_STEP = 3;
 
 /**
  * Main screen: every pair (sub-sandbox ⇄ its worktree) with its state, the
@@ -69,6 +73,30 @@ export function PairsView({
   const [index, setIndex] = useState(0);
   const [mode, setMode] = useState<Mode>({ kind: "list" });
   const [result, setResult] = useState<ActionResult | null>(null);
+  // How many journal lines the view is scrolled up from the newest one (0 = follow new events).
+  const [scroll, setScroll] = useState(0);
+  const maxScrollRef = useRef(0);
+  const pageRef = useRef(1);
+  const scrollBy = (delta: number) => setScroll((s) => Math.max(0, Math.min(maxScrollRef.current, s + delta)));
+
+  // The wheel scrolls the journal (the arrows select pairs).
+  useEffect(() => {
+    const onWheel = (dir: number) => scrollBy(dir < 0 ? WHEEL_STEP : -WHEEL_STEP);
+    mouseBus.on("wheel", onWheel);
+    return () => {
+      mouseBus.off("wheel", onWheel);
+    };
+  }, []);
+
+  // While scrolled back, new events must not move the lines being read.
+  const seen = useRef(events.length);
+  useEffect(() => {
+    const added = events.length - seen.current;
+    seen.current = events.length;
+    if (added > 0) {
+      setScroll((s) => (s > 0 ? s + added : 0));
+    }
+  }, [events.length]);
   const selected = pairs[Math.min(index, pairs.length - 1)];
   const first = Math.max(0, Math.min(index - Math.floor(maxItems / 2), pairs.length - maxItems));
   const git = workspace.gitEnabled;
@@ -155,7 +183,11 @@ export function PairsView({
       if (mode.kind !== "list") {
         return;
       }
-      if (input === "q" || input === "й") {
+      if (key.pageUp) {
+        scrollBy(pageRef.current);
+      } else if (key.pageDown) {
+        scrollBy(-pageRef.current);
+      } else if (input === "q" || input === "й") {
         onQuit();
       } else if (key.upArrow) {
         setIndex((i) => Math.max(0, i - 1));
@@ -225,7 +257,11 @@ export function PairsView({
                 ? 1
                 : (result?.lines.length ?? 0);
   const logRows = Math.max(1, rows - (3 + listRows) - modeRows - 2);
-  const shownLog = events.slice(-logRows);
+  const maxScroll = Math.max(0, events.length - logRows);
+  maxScrollRef.current = maxScroll;
+  pageRef.current = Math.max(1, logRows - 1);
+  const offset = Math.min(scroll, maxScroll);
+  const shownLog = events.slice(Math.max(0, events.length - logRows - offset), events.length - offset);
 
   return (
     <Box flexDirection="column" flexGrow={1}>
@@ -396,7 +432,16 @@ export function PairsView({
       )}
 
       <Box paddingX={1} flexShrink={0}>
-        <Text color={theme.muted} wrap="truncate-middle">журнал: {logPath}</Text>
+        {offset > 0 ? (
+          <Text color={theme.info} wrap="truncate-end">
+            журнал: история, ниже ещё {offset} {plural(offset, "строка", "строки", "строк")} — колесо вниз / PgDn
+          </Text>
+        ) : (
+          <Text color={theme.muted} wrap="truncate-middle">
+            журнал: {logPath}
+            {maxScroll > 0 ? "  (колесо / PgUp — история)" : ""}
+          </Text>
+        )}
       </Box>
       <Box flexDirection="column" paddingX={1} flexGrow={1} overflow="hidden">
         {shownLog.length === 0 ? (
@@ -408,7 +453,7 @@ export function PairsView({
 
       <Box paddingX={1} flexShrink={0}>
         <Text color={theme.muted} wrap="truncate-end">
-          ↑↓ выбрать · Enter открыть · c конфликты · p {selected?.paused ? "продолжить" : "пауза"} · r скан
+          ↑↓ выбрать · колесо журнал · Enter открыть · c конфликты · p {selected?.paused ? "продолжить" : "пауза"} · r скан
           {git ? " · n новая · d удалить · m слить сюда · k коммит" : ""}
           {selected?.merge ? " · a прервать слияние" : ""} · o корзина · q выход
         </Text>

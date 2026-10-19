@@ -28,7 +28,7 @@ type Screen =
   | { kind: "stopping" };
 
 /** Events kept in memory for the on-screen log (the journal file has all). */
-const MAX_EVENTS = 500;
+const MAX_EVENTS = 2000;
 
 /** Shown on the reconcile screen of a pair whose worktree was re-created or re-linked. */
 const REVIEW_NOTE =

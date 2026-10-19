@@ -2,8 +2,9 @@ import chalk from "chalk";
 
 /**
  * The anonymus mascot: an orange space invader wearing a Guy Fawkes mask,
- * drawn small — exactly as tall as the info lines next to it in the header
- * (14 pixel rows = 7 terminal rows) — and mirror-symmetric.
+ * drawn small (24×14) — exactly as tall as the info lines next to it in the header
+ * (14 pixel rows = 7 terminal rows) — and mirror-symmetric: arched brows,
+ * slanted eyes, cheek lines, the upturned moustache and the goatee.
  * One character per pixel; two pixel rows are packed into one terminal row
  * with the half-block glyphs ▀ / ▄ (foreground = one pixel, background = the
  * other), so the sprite keeps square-ish proportions.
@@ -13,20 +14,20 @@ import chalk from "chalk";
  *   K  outline / features
  */
 export const MASCOT_SPRITE: readonly string[] = [
-  "...OOOOOOOOOOOOOO...",
-  "...OOKKKKKKKKKKOO...",
-  "...OKWWWWWWWWWWKO...",
-  "...OKWKKKWWKKKWKO...",
-  "...OKWWKKWWKKWWKO...",
-  "...OKLWWWLLWWWLKO...",
-  "OOOOKWKWWWWWWKWKOOOO",
-  "OOOOKWWKKKKKKWWKOOOO",
-  "OOOODKWWWKKWWWKDOOOO",
-  "...OODKWWKKWWKDOO...",
-  "...OOODKWKKWKDOOO...",
-  "...OOOODKKKKDOOOO...",
-  "....O.O......O.O....",
-  "....D.D......D.D....",
+  "...OOKKKKKKKKKKKKKKOO...",
+  "...OKLWWWWWWWWWWWWLKO...",
+  "...OKKKKKLWWWWLKKKKKO...",
+  "...OKLWKKKWWWWKKKWLKO...",
+  "...OKWWWKKWLLWKKWWWKO...",
+  "...OKWKKWWWLLWWWKKWKO...",
+  "OOOKWWWLLWWWWWWLLWWWKOOO",
+  "OOOKWWKWWKKKKKKWWKWWKOOO",
+  "OOOKWWKKKKKKKKKKKKWWKOOO",
+  "OOODKWWKKKKWWKKKKWWKDOOO",
+  "...ODKLWWWWKKWWWWLKDO...",
+  "...OODKKWWWKKWWWKKDOO...",
+  "...OOOODKKKKKKKKDOOOO...",
+  "....D.D..........D.D....",
 ];
 
 const PALETTE: Record<string, string> = {
