@@ -46,7 +46,7 @@ function forceRm(p) {
 fs.mkdirSync(root, { recursive: true });
 // The three folders are emptied, not deleted: they may be open in VS Code or a
 // terminal. Anything else (an older layout of the stand) goes.
-const kept = new Set(["proj", "proj.worktrees", "sandboxes"]);
+const kept = new Set(["proj", "proj.worktrees", "sandboxes", ".vscode"]);
 for (const name of fs.readdirSync(root)) {
   if (!kept.has(name)) {
     forceRm(path.join(root, name));
@@ -210,6 +210,13 @@ fs.writeFileSync(
     null,
     2
   )
+);
+// The demo folder opened as is: worktrees are two levels down
+// (demo/proj.worktrees/<name>), deeper than VS Code scans by default.
+fs.mkdirSync(path.join(root, ".vscode"), { recursive: true });
+fs.writeFileSync(
+  path.join(root, ".vscode", "settings.json"),
+  JSON.stringify({ "files.autoGuessEncoding": true, "git.repositoryScanMaxDepth": 2 }, null, 2)
 );
 
 // Launcher that does not depend on PATH: calls node.exe and the built CLI by
