@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useInput, type DOMElement } from "ink";
 import Spinner from "ink-spinner";
 import TextInput from "ink-text-input";
 import { defaultMergeSources } from "../core/mergePrep.js";
 import type { PairProblem, ProblemCode } from "../core/pairGuard.js";
 import type { SyncEvent } from "../core/syncer.js";
-import { mouseBus } from "./mouse.js";
+import { hits, mouseBus } from "./mouse.js";
 import type { Workspace } from "../core/workspace.js";
 import { EventLine } from "./EventLine.js";
 import type { ActionResult, PairView } from "./pairState.js";
@@ -85,6 +85,21 @@ export function PairsView({
     mouseBus.on("wheel", onWheel);
     return () => {
       mouseBus.off("wheel", onWheel);
+    };
+  }, []);
+
+  // The "to the newest" button next to the journal title, clickable with the mouse.
+  const toBottomRef = useRef<DOMElement>(null);
+  const offsetRef = useRef(0);
+  useEffect(() => {
+    const onClick = (click: { x: number; y: number }) => {
+      if (offsetRef.current > 0 && hits(toBottomRef.current, click)) {
+        setScroll(0);
+      }
+    };
+    mouseBus.on("click", onClick);
+    return () => {
+      mouseBus.off("click", onClick);
     };
   }, []);
 
@@ -261,6 +276,7 @@ export function PairsView({
   maxScrollRef.current = maxScroll;
   pageRef.current = Math.max(1, logRows - 1);
   const offset = Math.min(scroll, maxScroll);
+  offsetRef.current = offset;
   const shownLog = events.slice(Math.max(0, events.length - logRows - offset), events.length - offset);
 
   return (
@@ -433,9 +449,16 @@ export function PairsView({
 
       <Box paddingX={1} flexShrink={0}>
         {offset > 0 ? (
-          <Text color={theme.info} wrap="truncate-end">
-            журнал: история, ниже ещё {offset} {plural(offset, "строка", "строки", "строк")} — колесо вниз / PgDn
-          </Text>
+          <>
+            <Box ref={toBottomRef} flexShrink={0}>
+              <Text backgroundColor={theme.accent} color="black" bold>
+                {" ↓ к последним "}
+              </Text>
+            </Box>
+            <Text color={theme.info} wrap="truncate-end">
+              {"  "}история: ниже ещё {offset} {plural(offset, "строка", "строки", "строк")} — колесо вниз / PgDn
+            </Text>
+          </>
         ) : (
           <Text color={theme.muted} wrap="truncate-middle">
             журнал: {logPath}

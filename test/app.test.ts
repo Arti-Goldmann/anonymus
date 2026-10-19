@@ -138,14 +138,24 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
     await until(() => out.screen.includes("MyProject/f39.c"), "newest transfer shown");
 
     press("\x1b[<64;5;5M\x1b[<64;5;5M"); // wheel up, two notches
-    await until(() => out.screen.includes("журнал: история"), "scrolled back");
+    await until(() => out.screen.includes("история: ниже"), "scrolled back");
     expect(out.screen).not.toContain("MyProject/f39.c");
     press("\x1b[B"); // an arrow key does not scroll
     await new Promise((r) => setTimeout(r, 200));
-    expect(out.screen).toContain("журнал: история");
+    expect(out.screen).toContain("история: ниже");
 
     press("\x1b[<65;5;5M\x1b[<65;5;5M"); // wheel down back to the newest lines
     await until(() => out.screen.includes("MyProject/f39.c"), "back at the newest");
-    expect(out.screen).not.toContain("журнал: история");
+    expect(out.screen).not.toContain("история: ниже");
+
+    // Scrolled back again, a click on "↓ к последним" jumps to the newest lines.
+    press("\x1b[<64;5;5M\x1b[<64;5;5M\x1b[<64;5;5M");
+    await until(() => out.screen.includes("к последним"), "button shown");
+    const lines = out.screen.split("\n");
+    const row = lines.findIndex((l) => l.includes("к последним"));
+    const col = lines[row].indexOf("↓");
+    press(`\x1b[<0;${col + 1};${row + 1}M\x1b[<0;${col + 1};${row + 1}m`);
+    await until(() => out.screen.includes("MyProject/f39.c"), "jumped to the newest");
+    expect(out.screen).not.toContain("к последним");
   });
 });

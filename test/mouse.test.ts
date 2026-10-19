@@ -16,9 +16,16 @@ describe("mouse wheel", () => {
     expect(seen).toEqual([-1, 1, 1]);
   });
 
-  it("turns the wheel into arrows when nobody listens, and drops clicks", () => {
+  it("turns the wheel into arrows when nobody listens; clicks never reach Ink", () => {
     expect(filterMouse(`${WHEEL_UP}${WHEEL_DOWN}`)).toBe("\x1b[A\x1b[B");
     expect(filterMouse(`${CLICK}x`)).toBe("x");
+  });
+
+  it("reports a left click once, at 0-based cells", () => {
+    const clicks: { x: number; y: number }[] = [];
+    mouseBus.on("click", (c) => clicks.push(c));
+    filterMouse(CLICK); // press + release
+    expect(clicks).toEqual([{ x: 9, y: 4 }]);
   });
 
   it("joins a mouse sequence split across two chunks; a lone Escape passes", async () => {
