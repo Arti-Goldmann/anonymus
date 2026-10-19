@@ -205,7 +205,7 @@ fs.writeFileSync(
       ],
       // Each worktree is a git repository one level down: Source Control
       // shows every one of them with its own changes.
-      settings: { "files.autoGuessEncoding": true, "git.repositoryScanMaxDepth": 1, "scm.defaultViewMode": "tree" },
+      settings: { "files.autoGuessEncoding": true, "git.repositoryScanMaxDepth": 1, "scm.defaultViewMode": "tree", "terminal.integrated.tabs.title": "${sequence}" },
     },
     null,
     2
@@ -216,7 +216,7 @@ fs.writeFileSync(
 fs.mkdirSync(path.join(root, ".vscode"), { recursive: true });
 fs.writeFileSync(
   path.join(root, ".vscode", "settings.json"),
-  JSON.stringify({ "files.autoGuessEncoding": true, "git.repositoryScanMaxDepth": 2, "scm.defaultViewMode": "tree" }, null, 2)
+  JSON.stringify({ "files.autoGuessEncoding": true, "git.repositoryScanMaxDepth": 2, "scm.defaultViewMode": "tree", "terminal.integrated.tabs.title": "${sequence}" }, null, 2)
 );
 
 // Launcher that does not depend on PATH: calls node.exe and the built CLI by
