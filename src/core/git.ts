@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SERVICE_DIR } from "../config/schema.js";
@@ -65,6 +65,35 @@ export class Git {
       const out = `${err.stderr?.toString("utf8") ?? ""}${err.stdout?.toString("utf8") ?? ""}`.trim();
       throw new GitError(`git ${args[0]}: ${out.split("\n")[0] || err.message}`, out);
     }
+  }
+
+  /**
+   * Run git without blocking the event loop — for the slow commands
+   * (checking out a worktree, cloning submodules) so the UI keeps drawing.
+   */
+  private runAsync(args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        "git",
+        args,
+        {
+          cwd: this.cwd,
+          windowsHide: true,
+          maxBuffer: 256 * 1024 * 1024,
+          env: env ? { ...process.env, ...env } : undefined,
+        },
+        (error, stdout, stderr) => {
+          if (!error) {
+            resolve(stdout.trimEnd());
+          } else if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            reject(new GitError("git не найден в PATH"));
+          } else {
+            const out = `${stderr}${stdout}`.trim();
+            reject(new GitError(`git ${args[0]}: ${out.split("\n")[0] || error.message}`, out));
+          }
+        }
+      ).stdin?.end();
+    });
   }
 
   isRepo(): boolean {
@@ -213,8 +242,8 @@ export class Git {
   }
 
   /** New worktree at `dir` with `branch` checked out (the branch must exist). */
-  worktreeAdd(dir: string, branch: string): void {
-    this.run(["worktree", "add", "--quiet", dir, branch]);
+  async worktreeAdd(dir: string, branch: string): Promise<void> {
+    await this.runAsync(["worktree", "add", "--quiet", dir, branch]);
   }
 
   /** Remove a worktree; `force` also discards its uncommitted changes. */
@@ -232,8 +261,8 @@ export class Git {
    * folders empty. They are cloned from the URLs in .gitmodules; git must not
    * stop to ask for a password in a terminal nobody sees.
    */
-  submoduleUpdate(): void {
-    this.run(["submodule", "update", "--init", "--recursive"], { GIT_TERMINAL_PROMPT: "0" });
+  async submoduleUpdate(): Promise<void> {
+    await this.runAsync(["submodule", "update", "--init", "--recursive"], { GIT_TERMINAL_PROMPT: "0" });
   }
 
   /** Forget worktrees whose folders are gone. */

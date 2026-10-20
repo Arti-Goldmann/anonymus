@@ -322,11 +322,11 @@ function printSandboxes(workspace: Workspace): void {
   }
 }
 
-function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: string, args: Args): void {
+async function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: string, args: Args): Promise<void> {
   const step = (m: string) => console.log(`  … ${m}`);
   try {
     if (action === "new") {
-      workspace.create(name, { from: args.from }, step, (m) => console.log(`⚠ ${m}`));
+      await workspace.create(name, { from: args.from }, step, (m) => console.log(`⚠ ${m}`));
       console.log("готово. Запустите anonymus — песочница заполнится из worktree.");
     } else {
       const { warnings } = workspace.remove(name, { force: args.force }, step);
@@ -475,7 +475,7 @@ async function main(): Promise<void> {
   process.on("exit", lock.release);
 
   if (args.command === "sandbox") {
-    runSandboxCommand(workspace, args.sandboxAction!, args.name!, args);
+    await runSandboxCommand(workspace, args.sandboxAction!, args.name!, args);
     return;
   }
   if (args.command === "merge") {

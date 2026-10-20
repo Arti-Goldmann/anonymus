@@ -101,7 +101,7 @@ const names = Array.from({ length: PAIRS }, (_, k) => `agent-${k + 1}`);
 console.log("1. создание подпесочниц и первое заполнение");
 for (const name of names) {
   t = t0();
-  ws.create(name, { from: "master" });
+  await ws.create(name, { from: "master" });
   const created = t0() - t;
   t = t0();
   const engine = ws.engineFor(name);

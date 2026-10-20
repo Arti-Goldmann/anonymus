@@ -216,12 +216,12 @@ export class Workspace {
    * checked out anywhere), its worktree with the ownership mark, and an
    * empty sandbox folder — the first scan fills it from the worktree.
    */
-  create(
+  async create(
     name: string,
     options: { from?: string } = {},
     step: StepReporter = () => {},
     warn: StepReporter = () => {}
-  ): SandboxEntry {
+  ): Promise<SandboxEntry> {
     const n = name.trim();
     const problem = this.validateNewName(n);
     if (problem) {
@@ -245,7 +245,7 @@ export class Workspace {
     step(`git worktree add ${worktree}`);
     try {
       fs.mkdirSync(path.dirname(worktree), { recursive: true });
-      git.worktreeAdd(worktree, n);
+      await git.worktreeAdd(worktree, n);
     } catch (e) {
       if (createdBranch) {
         git.deleteBranch(n);
@@ -263,7 +263,7 @@ export class Workspace {
       merge: null,
     });
     this.markWorktree(entry);
-    this.initSubmodules(entry, step, warn);
+    await this.initSubmodules(entry, step, warn);
     step(`создаю папку песочницы ${entry.sandbox}`);
     fs.mkdirSync(entry.sandbox, { recursive: true });
     this.registry!.save();
@@ -275,14 +275,14 @@ export class Workspace {
    * not get them. A failure (no network, no access) does not stop the pair:
    * it is reported, and the same command can be run by hand later.
    */
-  private initSubmodules(entry: SandboxEntry, step: StepReporter, warn: StepReporter): void {
+  private async initSubmodules(entry: SandboxEntry, step: StepReporter, warn: StepReporter): Promise<void> {
     const git = new Git(entry.worktree);
     if (!git.hasSubmodules()) {
       return;
     }
-    step("git submodule update --init --recursive");
+    step("скачиваю подмодули (git submodule update --init --recursive) — по сети это может занять время");
     try {
-      git.submoduleUpdate();
+      await git.submoduleUpdate();
     } catch (e) {
       warn(
         `подмодули не скачались (${(e as Error).message}) — их папки в песочнице будут пустыми; ` +
@@ -378,7 +378,7 @@ export class Workspace {
    * Its uncommitted work is lost while the sandbox may still have it, so the
    * old sync history is dropped and the pair waits for a review.
    */
-  recreateWorktree(name: string, step: StepReporter = () => {}, warn: StepReporter = () => {}): void {
+  async recreateWorktree(name: string, step: StepReporter = () => {}, warn: StepReporter = () => {}): Promise<void> {
     const entry = this.entry(name);
     const git = this.git!;
     if (!git.branchExists(entry.branch)) {
@@ -396,10 +396,10 @@ export class Workspace {
     }
     step(`git worktree add ${entry.worktree} ${entry.branch}`);
     fs.mkdirSync(path.dirname(entry.worktree), { recursive: true });
-    git.worktreeAdd(entry.worktree, entry.branch);
+    await git.worktreeAdd(entry.worktree, entry.branch);
     entry.worktreeId = randomUUID();
     this.markWorktree(entry);
-    this.initSubmodules(entry, step, warn);
+    await this.initSubmodules(entry, step, warn);
     this.requireReview(entry, trashDir);
   }
 

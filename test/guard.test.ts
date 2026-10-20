@@ -33,7 +33,7 @@ describe("pair guard: a sandbox only ever syncs with its own worktree", () => {
     bench.gitInit();
     bench.git("branch", "other");
     const ws = new Workspace(bench.config());
-    const entry = ws.create("feature");
+    const entry = await ws.create("feature");
     const live = await livePair(ws, "feature");
     syncer = live.syncer;
     // Uncommitted agent work that only lives in the pair so far.
@@ -130,7 +130,7 @@ describe("pair guard: a sandbox only ever syncs with its own worktree", () => {
     const { ws } = await setup();
     await syncer!.stop();
     syncer = null;
-    ws.create("second");
+    await ws.create("second");
     const file = path.join(bench.project, ".anonymus", "sandboxes.json");
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
     data.sandboxes[1].worktree = data.sandboxes[0].worktree;
@@ -145,7 +145,7 @@ describe("pair guard: a sandbox only ever syncs with its own worktree", () => {
     await syncer!.stop();
     syncer = null;
 
-    ws.recreateWorktree("feature");
+    await ws.recreateWorktree("feature");
     expect(ws.check("feature", true)).toBeNull();
     expect(ws.pair("feature").entry!.needsReview).toBe(true);
     // The worktree has the committed text, the sandbox the agent's work; the

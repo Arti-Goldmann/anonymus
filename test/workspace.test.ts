@@ -25,7 +25,7 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     return new Workspace(bench.config());
   }
 
-  it("starts without pairs; the main folder is never synced", () => {
+  it("starts without pairs; the main folder is never synced", async () => {
     const ws = setup();
     expect(ws.gitEnabled).toBe(true);
     expect(ws.pairs()).toEqual([]);
@@ -34,7 +34,7 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
 
   it("creates a branch, its worktree with the ownership mark and an anonymized sandbox folder", async () => {
     const ws = setup();
-    const entry = ws.create("BIGcorpProject-uart");
+    const entry = await ws.create("BIGcorpProject-uart");
 
     expect(bench.git("branch", "--show-current")).toBe("master"); // main folder untouched
     expect(entry.branch).toBe("BIGcorpProject-uart");
@@ -55,20 +55,20 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     expect(fs.existsSync(path.join(entry.sandbox, ".git"))).toBe(false);
   });
 
-  it("takes an existing branch that is not checked out anywhere", () => {
+  it("takes an existing branch that is not checked out anywhere", async () => {
     const ws = setup();
     bench.git("branch", "old-feature");
     expect(ws.isExistingBranch("old-feature")).toBe(true);
-    const entry = ws.create("old-feature");
+    const entry = await ws.create("old-feature");
     expect(entry.base).toBeNull();
     expect(bench.gitIn(entry.worktree, "branch", "--show-current")).toBe("old-feature");
     // master is checked out in the main folder: git cannot give it to a worktree.
     expect(ws.validateNewName("master")).toMatch(/уже выбрана/);
   });
 
-  it("rejects bad or duplicate names", () => {
+  it("rejects bad or duplicate names", async () => {
     const ws = setup();
-    ws.create("feature");
+    await ws.create("feature");
     expect(ws.validateNewName("bad name with ..")).toMatch(/не подходит/);
     expect(ws.validateNewName("feature")).toMatch(/уже есть/);
     expect(ws.validateNewName("ok-name")).toBeNull();
@@ -76,8 +76,8 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
 
   it("syncs several pairs at the same time, each with its own worktree", async () => {
     const ws = setup();
-    const a = ws.create("agent-a");
-    const b = ws.create("agent-b");
+    const a = await ws.create("agent-a");
+    const b = await ws.create("agent-b");
     const pa = await livePair(ws, "agent-a");
     const pb = await livePair(ws, "agent-b");
     stops.push(() => pa.syncer.stop(), () => pb.syncer.stop());
@@ -97,7 +97,7 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
 
   it("commits a pair's work in its worktree, without anonymus' own files", async () => {
     const ws = setup();
-    const e = ws.create("feature");
+    const e = await ws.create("feature");
     fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "main.c"), "int v = 2;\n");
     expect(ws.commit("feature", "work")).toBe(true);
     expect(bench.git("log", "-1", "--format=%s", "feature")).toBe("work");
@@ -106,7 +106,7 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
 
   it("removes a pair: sandbox to the trash, worktree via git, branch kept", async () => {
     const ws = setup();
-    const e = ws.create("feature");
+    const e = await ws.create("feature");
     await reconcilePair(ws, "feature");
     const { trashDir } = ws.remove("feature");
     expect(fs.existsSync(e.worktree)).toBe(false);
@@ -117,9 +117,9 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     expect(bench.git("worktree", "list").split("\n")).toHaveLength(1);
   });
 
-  it("refuses to remove a worktree with uncommitted work unless forced, then keeps a copy", () => {
+  it("refuses to remove a worktree with uncommitted work unless forced, then keeps a copy", async () => {
     const ws = setup();
-    const e = ws.create("feature");
+    const e = await ws.create("feature");
     fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "main.c"), "int v = 9;\n");
     fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "new.c"), "// new\n");
     expect(ws.uncommitted("feature")).toHaveLength(2);
@@ -132,7 +132,7 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     expect(fs.existsSync(e.worktree)).toBe(false);
   });
 
-  it("refuses the old stash-based registry with a clear message", () => {
+  it("refuses the old stash-based registry with a clear message", async () => {
     bench = makeBench();
     bench.write("project", "a.txt", "a\n");
     bench.gitInit();
@@ -140,7 +140,7 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     expect(() => new Workspace(bench.config())).toThrow(RegistryFormatError);
   });
 
-  it("allows only one running instance per project", () => {
+  it("allows only one running instance per project", async () => {
     bench = makeBench();
     const dir = path.join(bench.project, ".anonymus");
     const first = acquireLock(dir);
@@ -188,9 +188,9 @@ describe("Workspace: submodules", () => {
     const { ws } = setup();
     const steps: string[] = [];
     const warnings: string[] = [];
-    const e = ws.create("feature", {}, (m) => steps.push(m), (m) => warnings.push(m));
+    const e = await ws.create("feature", {}, (m) => steps.push(m), (m) => warnings.push(m));
     expect(warnings).toEqual([]);
-    expect(steps).toContain("git submodule update --init --recursive");
+    expect(steps.some((s) => s.includes("git submodule update --init --recursive"))).toBe(true);
     expect(fs.readFileSync(path.join(e.worktree, "CoodEdit", "xml_DB", "TextBase.xml"), "utf8")).toContain("BIGcorpProject");
 
     await reconcilePair(ws, "feature");
@@ -214,18 +214,18 @@ describe("Workspace: submodules", () => {
     );
   });
 
-  it("removes a clean pair with submodules without asking for force", () => {
+  it("removes a clean pair with submodules without asking for force", async () => {
     const { ws } = setup();
-    const e = ws.create("feature");
+    const e = await ws.create("feature");
     ws.remove("feature");
     expect(fs.existsSync(e.worktree)).toBe(false);
   });
 
-  it("still creates the pair when a submodule cannot be fetched, and says how to retry", () => {
+  it("still creates the pair when a submodule cannot be fetched, and says how to retry", async () => {
     const { ws, lib } = setup();
     fs.rmSync(lib, { recursive: true, force: true }); // the submodule's repository is unreachable
     const warnings: string[] = [];
-    const e = ws.create("feature", {}, () => {}, (m) => warnings.push(m));
+    const e = await ws.create("feature", {}, () => {}, (m) => warnings.push(m));
     expect(warnings[0]).toMatch(/подмодули не скачались/);
     expect(warnings[0]).toContain("submodule update --init --recursive");
     expect(ws.check("feature", false)).toBeNull();

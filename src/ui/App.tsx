@@ -386,7 +386,7 @@ export function App({
     async (name: string, from: string): Promise<ActionResult> => {
       let entryInfo: ActionResult;
       try {
-        const entry = workspace.create(name, { from }, (m) => info(m, name), (m) => warn(m, name));
+        const entry = await workspace.create(name, { from }, (m) => info(m, name), (m) => warn(m, name));
         syncList();
         entryInfo = {
           ok: true,
@@ -435,7 +435,7 @@ export function App({
       await stopPair(name);
       try {
         if (action === "recreate") {
-          workspace.recreateWorktree(name, (m) => info(m, name), (m) => warn(m, name));
+          await workspace.recreateWorktree(name, (m) => info(m, name), (m) => warn(m, name));
         } else if (action === "relink") {
           workspace.relink(name);
           info("worktree привязан заново", name);

@@ -31,9 +31,9 @@ describe("merging the work of several agents with git merge", () => {
     bench.write("project", ".gitignore", "anonymus.yaml\n.anonymus/\n");
     bench.gitInit();
     const ws = new Workspace(bench.config());
-    ws.create("result-merge", { from: "master" });
+    await ws.create("result-merge", { from: "master" });
     for (const name of ["agent-a", "agent-b", "agent-c"]) {
-      ws.create(name, { from: "result-merge" });
+      await ws.create(name, { from: "result-merge" });
     }
     for (const p of ws.pairs()) {
       syncers.set(p.name, (await livePair(ws, p.name)).syncer);
