@@ -276,19 +276,64 @@ export class Workspace {
    * it is reported, and the same command can be run by hand later.
    */
   private async initSubmodules(entry: SandboxEntry, step: StepReporter, warn: StepReporter): Promise<void> {
-    const git = new Git(entry.worktree);
-    if (!git.hasSubmodules()) {
+    if (!new Git(entry.worktree).hasSubmodules()) {
       return;
     }
-    step("скачиваю подмодули (git submodule update --init --recursive) — по сети это может занять время");
-    try {
-      await git.submoduleUpdate();
-    } catch (e) {
+    const failed = await this.checkoutSubmodules(entry.worktree, this.config.projectRoot, step);
+    if (failed.length > 0) {
       warn(
-        `подмодули не скачались (${(e as Error).message}) — их папки в песочнице будут пустыми; ` +
+        `подмодули не скачались: ${failed.join("; ")} — их папки в песочнице будут пустыми; ` +
           `повторите вручную: git -C "${entry.worktree}" submodule update --init --recursive`
       );
     }
+  }
+
+  /**
+   * Check out the submodules of `dir`, recursively. Each one is cloned from
+   * the copy in the main folder (`mainDir`) when that copy has the pinned
+   * commit — seconds instead of a network clone — and then pointed at the
+   * same remote as that copy, so later fetches go to the real server.
+   * Otherwise it is cloned from its URL. Returns what could not be fetched.
+   */
+  private async checkoutSubmodules(dir: string, mainDir: string | null, step: StepReporter): Promise<string[]> {
+    const git = new Git(dir);
+    const failed: string[] = [];
+    for (const sub of git.submodules()) {
+      const sha = git.submoduleCommit(sub.path);
+      if (!sha) {
+        continue; // declared in .gitmodules but not part of this commit
+      }
+      const target = path.join(dir, ...sub.path.split("/"));
+      const local = mainDir ? path.join(mainDir, ...sub.path.split("/")) : null;
+      const localGit = local && readWorktreeLink(local).kind !== "missing" ? new Git(local) : null;
+      let done = false;
+      if (localGit?.hasCommit(sha)) {
+        step(`подмодуль ${sub.path}: копирую из основной папки проекта`);
+        try {
+          await git.submoduleUpdate(sub.path, { fromLocal: { name: sub.name, dir: local! } });
+          const url = localGit.originUrl();
+          if (url) {
+            new Git(target).setOriginUrl(url);
+          }
+          done = true;
+        } catch {
+          // fall back to the network below
+        }
+      }
+      if (!done) {
+        step(`подмодуль ${sub.path}: скачиваю по сети — это может занять время`);
+        try {
+          await git.submoduleUpdate(sub.path);
+        } catch (e) {
+          failed.push(`${sub.path} (${(e as Error).message})`);
+          continue;
+        }
+      }
+      if (new Git(target).hasSubmodules()) {
+        failed.push(...(await this.checkoutSubmodules(target, localGit ? local : null, step)));
+      }
+    }
+    return failed;
   }
 
   private markWorktree(entry: SandboxEntry): void {

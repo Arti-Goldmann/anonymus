@@ -144,7 +144,7 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
     await new Promise((r) => setTimeout(r, 200));
     expect(out.screen).toContain("история: ниже");
 
-    press("\x1b[<65;5;5M\x1b[<65;5;5M"); // wheel down back to the newest lines
+    press("\x1b[<65;5;5M".repeat(8)); // wheel down, with room to spare: new lines may still arrive
     await until(() => out.screen.includes("MyProject/f39.c"), "back at the newest");
     expect(out.screen).not.toContain("история: ниже");
 

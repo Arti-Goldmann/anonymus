@@ -184,14 +184,24 @@ describe("Workspace: submodules", () => {
     return { ws: new Workspace(bench.config()), lib };
   }
 
-  it("checks out submodules in a new worktree, so they reach the sandbox", async () => {
-    const { ws } = setup();
+  it("copies submodules from the main folder — no network needed — so they reach the sandbox", async () => {
+    const { ws, lib } = setup();
+    const libUrl = bench.gitIn(path.join(bench.project, "CoodEdit", "xml_DB"), "remote", "get-url", "origin");
+    fs.renameSync(lib, `${lib}-offline`); // the submodule's server is unreachable
     const steps: string[] = [];
     const warnings: string[] = [];
     const e = await ws.create("feature", {}, (m) => steps.push(m), (m) => warnings.push(m));
     expect(warnings).toEqual([]);
-    expect(steps.some((s) => s.includes("git submodule update --init --recursive"))).toBe(true);
-    expect(fs.readFileSync(path.join(e.worktree, "CoodEdit", "xml_DB", "TextBase.xml"), "utf8")).toContain("BIGcorpProject");
+    expect(steps.some((s) => s.includes("копирую из основной папки"))).toBe(true);
+    const sub = path.join(e.worktree, "CoodEdit", "xml_DB");
+    expect(fs.readFileSync(path.join(sub, "TextBase.xml"), "utf8")).toContain("BIGcorpProject");
+    // An independent clone that fetches from the real server, not from the main folder.
+    expect(bench.gitIn(sub, "remote", "get-url", "origin")).toBe(libUrl);
+    const subGitDir = bench.gitIn(sub, "rev-parse", "--absolute-git-dir");
+    expect(fs.existsSync(path.join(subGitDir, "objects", "info", "alternates"))).toBe(false);
+    // The repository's own submodule settings are left as they were.
+    expect(bench.git("config", "--get", "submodule.CoodEdit/xml_DB.url")).toBe(libUrl);
+    fs.renameSync(`${lib}-offline`, lib);
 
     await reconcilePair(ws, "feature");
     expect(fs.readFileSync(path.join(e.sandbox, "CoodEdit", "xml_DB", "TextBase.xml"), "utf8")).toBe(
@@ -221,9 +231,19 @@ describe("Workspace: submodules", () => {
     expect(fs.existsSync(e.worktree)).toBe(false);
   });
 
+  it("falls back to the network when the main folder has no copy of the submodule", async () => {
+    const { ws } = setup();
+    bench.git("submodule", "deinit", "--quiet", "--force", "--", "CoodEdit/xml_DB");
+    const steps: string[] = [];
+    const e = await ws.create("feature", {}, (m) => steps.push(m));
+    expect(steps.some((s) => s.includes("скачиваю по сети"))).toBe(true);
+    expect(fs.existsSync(path.join(e.worktree, "CoodEdit", "xml_DB", "TextBase.xml"))).toBe(true);
+  });
+
   it("still creates the pair when a submodule cannot be fetched, and says how to retry", async () => {
     const { ws, lib } = setup();
-    fs.rmSync(lib, { recursive: true, force: true }); // the submodule's repository is unreachable
+    bench.git("submodule", "deinit", "--quiet", "--force", "--", "CoodEdit/xml_DB"); // no local copy
+    fs.rmSync(lib, { recursive: true, force: true }); // and the server is unreachable
     const warnings: string[] = [];
     const e = await ws.create("feature", {}, () => {}, (m) => warnings.push(m));
     expect(warnings[0]).toMatch(/подмодули не скачались/);

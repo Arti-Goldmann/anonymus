@@ -256,13 +256,73 @@ export class Git {
     return fs.existsSync(path.join(this.cwd, ".gitmodules"));
   }
 
+  /** Submodules declared in .gitmodules: their config name and path. */
+  submodules(): { name: string; path: string }[] {
+    let out: string;
+    try {
+      out = this.run(["config", "--file", ".gitmodules", "--get-regexp", "^submodule\\..*\\.path$"]);
+    } catch {
+      return []; // no .gitmodules or no entries
+    }
+    return out
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const space = line.indexOf(" ");
+        const key = line.slice(0, space);
+        return { name: key.slice("submodule.".length, -".path".length), path: line.slice(space + 1).trim() };
+      });
+  }
+
+  /** Commit a submodule is pinned to in HEAD, or null if `path` is not a submodule there. */
+  submoduleCommit(subPath: string): string | null {
+    try {
+      const m = /^160000 commit ([0-9a-f]+)\t/.exec(this.run(["ls-tree", "HEAD", "--", subPath]));
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Does this repository have the commit? */
+  hasCommit(sha: string): boolean {
+    try {
+      this.run(["cat-file", "-e", `${sha}^{commit}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** URL of `origin`, if there is one. */
+  originUrl(): string | null {
+    try {
+      return this.run(["remote", "get-url", "origin"]) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  setOriginUrl(url: string): void {
+    this.run(["remote", "set-url", "origin", url]);
+  }
+
   /**
-   * Check out the submodules (recursively): `git worktree add` leaves their
-   * folders empty. They are cloned from the URLs in .gitmodules; git must not
-   * stop to ask for a password in a terminal nobody sees.
+   * Check out one submodule: `git worktree add` leaves its folder empty. With
+   * `fromLocal` the clone comes from a checkout already on disk (the main
+   * folder's copy) instead of the network: a full, independent clone — only
+   * for this command the local file protocol is allowed. Otherwise it is
+   * cloned from the URL in .gitmodules; git must not stop to ask for a
+   * password in a terminal nobody sees.
    */
-  async submoduleUpdate(): Promise<void> {
-    await this.runAsync(["submodule", "update", "--init", "--recursive"], { GIT_TERMINAL_PROMPT: "0" });
+  async submoduleUpdate(subPath: string, options: { fromLocal?: { name: string; dir: string }; recursive?: boolean } = {}): Promise<void> {
+    const local = options.fromLocal
+      ? ["-c", "protocol.file.allow=always", "-c", `submodule.${options.fromLocal.name}.url=${options.fromLocal.dir}`]
+      : [];
+    await this.runAsync(
+      [...local, "submodule", "update", "--init", ...(options.recursive ? ["--recursive"] : []), "--", subPath],
+      { GIT_TERMINAL_PROMPT: "0" }
+    );
   }
 
   /** Forget worktrees whose folders are gone. */
