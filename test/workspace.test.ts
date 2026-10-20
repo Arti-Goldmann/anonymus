@@ -148,6 +148,23 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     // Simulate another live process holding the lock.
     fs.writeFileSync(path.join(dir, "lock"), String(process.ppid));
     expect(acquireLock(dir)).toEqual({ heldBy: process.ppid });
+    if ("release" in first) first.release();
+  });
+
+  it("takes over a lock left behind, even if its PID now belongs to another program", async () => {
+    bench = makeBench();
+    const dir = path.join(bench.project, ".anonymus");
+    const file = path.join(dir, "lock");
+    fs.mkdirSync(dir, { recursive: true });
+    // A live PID (our parent), but nobody has refreshed the lock for a minute.
+    fs.writeFileSync(file, String(process.ppid));
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(file, old, old);
+    const lock = acquireLock(dir);
+    expect("release" in lock).toBe(true);
+    expect(fs.readFileSync(file, "utf8")).toBe(String(process.pid));
+    if ("release" in lock) lock.release();
+    expect(fs.existsSync(file)).toBe(false);
   });
 });
 
