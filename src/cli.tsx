@@ -326,7 +326,7 @@ function runSandboxCommand(workspace: Workspace, action: SandboxAction, name: st
   const step = (m: string) => console.log(`  … ${m}`);
   try {
     if (action === "new") {
-      workspace.create(name, { from: args.from }, step);
+      workspace.create(name, { from: args.from }, step, (m) => console.log(`⚠ ${m}`));
       console.log("готово. Запустите anonymus — песочница заполнится из worktree.");
     } else {
       const { warnings } = workspace.remove(name, { force: args.force }, step);

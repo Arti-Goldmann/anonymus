@@ -151,6 +151,88 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
   });
 });
 
+describe("Workspace: submodules", () => {
+  let bench: Bench;
+  // Local submodules are cloned over the file protocol, which git refuses by default.
+  const savedEnv = { ...process.env };
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    bench?.cleanup();
+  });
+
+  function setup(): { ws: Workspace; lib: string } {
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "protocol.file.allow";
+    process.env.GIT_CONFIG_VALUE_0 = "always";
+    bench = makeBench();
+    // The submodule's own repository.
+    const lib = path.join(bench.root, "xml-lib");
+    fs.mkdirSync(lib);
+    fs.writeFileSync(path.join(lib, "TextBase.xml"), "<base owner=\"BIGcorpProject\"/>\n");
+    const libGit = (...a: string[]) => bench.gitIn(lib, ...a);
+    libGit("init", "--quiet", "--initial-branch=master");
+    libGit("config", "user.name", "test");
+    libGit("config", "user.email", "test@example.com");
+    libGit("add", "-A");
+    libGit("commit", "--quiet", "-m", "lib");
+
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1;\n");
+    bench.write("project", ".gitignore", "anonymus.yaml\n.anonymus/\n");
+    bench.gitInit();
+    bench.git("submodule", "--quiet", "add", lib.split(path.sep).join("/"), "CoodEdit/xml_DB");
+    bench.git("commit", "--quiet", "-m", "submodule");
+    return { ws: new Workspace(bench.config()), lib };
+  }
+
+  it("checks out submodules in a new worktree, so they reach the sandbox", async () => {
+    const { ws } = setup();
+    const steps: string[] = [];
+    const warnings: string[] = [];
+    const e = ws.create("feature", {}, (m) => steps.push(m), (m) => warnings.push(m));
+    expect(warnings).toEqual([]);
+    expect(steps).toContain("git submodule update --init --recursive");
+    expect(fs.readFileSync(path.join(e.worktree, "CoodEdit", "xml_DB", "TextBase.xml"), "utf8")).toContain("BIGcorpProject");
+
+    await reconcilePair(ws, "feature");
+    expect(fs.readFileSync(path.join(e.sandbox, "CoodEdit", "xml_DB", "TextBase.xml"), "utf8")).toBe(
+      '<base owner="MyProject"/>\n'
+    );
+    // The submodule's `.git` file stays on the project side.
+    expect(fs.existsSync(path.join(e.sandbox, "CoodEdit", "xml_DB", ".git"))).toBe(false);
+
+    // An edit inside the submodule counts as uncommitted work of the pair.
+    fs.writeFileSync(path.join(e.worktree, "CoodEdit", "xml_DB", "TextBase.xml"), "<base edited/>\n");
+    expect(() => ws.remove("feature")).toThrow(/незакоммиченные изменения/);
+
+    // git refuses `worktree remove` with submodules unless forced — removing the pair still works,
+    // and the edited submodule is kept in the trash.
+    const { trashDir } = ws.remove("feature", { force: true });
+    expect(fs.existsSync(e.worktree)).toBe(false);
+    expect(bench.git("worktree", "list").split("\n")).toHaveLength(1);
+    expect(fs.readFileSync(path.join(trashDir, "worktree", "CoodEdit", "xml_DB", "TextBase.xml"), "utf8")).toBe(
+      "<base edited/>\n"
+    );
+  });
+
+  it("removes a clean pair with submodules without asking for force", () => {
+    const { ws } = setup();
+    const e = ws.create("feature");
+    ws.remove("feature");
+    expect(fs.existsSync(e.worktree)).toBe(false);
+  });
+
+  it("still creates the pair when a submodule cannot be fetched, and says how to retry", () => {
+    const { ws, lib } = setup();
+    fs.rmSync(lib, { recursive: true, force: true }); // the submodule's repository is unreachable
+    const warnings: string[] = [];
+    const e = ws.create("feature", {}, () => {}, (m) => warnings.push(m));
+    expect(warnings[0]).toMatch(/подмодули не скачались/);
+    expect(warnings[0]).toContain("submodule update --init --recursive");
+    expect(ws.check("feature", false)).toBeNull();
+    expect(fs.existsSync(e.sandbox)).toBe(true);
+  });
+});
+
 describe("Workspace without git", () => {
   let bench: Bench;
   afterEach(() => bench?.cleanup());

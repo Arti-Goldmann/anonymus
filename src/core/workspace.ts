@@ -216,7 +216,12 @@ export class Workspace {
    * checked out anywhere), its worktree with the ownership mark, and an
    * empty sandbox folder — the first scan fills it from the worktree.
    */
-  create(name: string, options: { from?: string } = {}, step: StepReporter = () => {}): SandboxEntry {
+  create(
+    name: string,
+    options: { from?: string } = {},
+    step: StepReporter = () => {},
+    warn: StepReporter = () => {}
+  ): SandboxEntry {
     const n = name.trim();
     const problem = this.validateNewName(n);
     if (problem) {
@@ -258,10 +263,32 @@ export class Workspace {
       merge: null,
     });
     this.markWorktree(entry);
+    this.initSubmodules(entry, step, warn);
     step(`создаю папку песочницы ${entry.sandbox}`);
     fs.mkdirSync(entry.sandbox, { recursive: true });
     this.registry!.save();
     return entry;
+  }
+
+  /**
+   * `git worktree add` leaves submodule folders empty, so the sandbox would
+   * not get them. A failure (no network, no access) does not stop the pair:
+   * it is reported, and the same command can be run by hand later.
+   */
+  private initSubmodules(entry: SandboxEntry, step: StepReporter, warn: StepReporter): void {
+    const git = new Git(entry.worktree);
+    if (!git.hasSubmodules()) {
+      return;
+    }
+    step("git submodule update --init --recursive");
+    try {
+      git.submoduleUpdate();
+    } catch (e) {
+      warn(
+        `подмодули не скачались (${(e as Error).message}) — их папки в песочнице будут пустыми; ` +
+          `повторите вручную: git -C "${entry.worktree}" submodule update --init --recursive`
+      );
+    }
   }
 
   private markWorktree(entry: SandboxEntry): void {
@@ -311,14 +338,22 @@ export class Workspace {
       }
       for (const file of dirty) {
         const from = path.join(entry.worktree, ...file.split("/"));
-        if (fs.existsSync(from) && fs.statSync(from).isFile()) {
-          const to = path.join(trashDir, "worktree", ...file.split("/"));
-          fs.mkdirSync(path.dirname(to), { recursive: true });
+        const to = path.join(trashDir, "worktree", ...file.split("/"));
+        if (!fs.existsSync(from)) {
+          continue;
+        }
+        fs.mkdirSync(path.dirname(to), { recursive: true });
+        if (fs.statSync(from).isFile()) {
           fs.copyFileSync(from, to);
+        } else {
+          // A submodule with changes inside: keep its whole working copy.
+          fs.cpSync(from, to, { recursive: true, filter: (src) => path.basename(src) !== ".git" });
         }
       }
       step(`git worktree remove ${entry.worktree}`);
-      git.worktreeRemove(entry.worktree, dirty.length > 0);
+      // git refuses to remove a worktree with submodules unless forced; any
+      // uncommitted work in it was refused above or backed up just now.
+      git.worktreeRemove(entry.worktree, dirty.length > 0 || wtGit.hasSubmodules());
     } else if (problem.code === "worktree-missing" || problem.code === "sandbox-missing") {
       git.worktreePrune();
     } else {
@@ -343,7 +378,7 @@ export class Workspace {
    * Its uncommitted work is lost while the sandbox may still have it, so the
    * old sync history is dropped and the pair waits for a review.
    */
-  recreateWorktree(name: string, step: StepReporter = () => {}): void {
+  recreateWorktree(name: string, step: StepReporter = () => {}, warn: StepReporter = () => {}): void {
     const entry = this.entry(name);
     const git = this.git!;
     if (!git.branchExists(entry.branch)) {
@@ -364,6 +399,7 @@ export class Workspace {
     git.worktreeAdd(entry.worktree, entry.branch);
     entry.worktreeId = randomUUID();
     this.markWorktree(entry);
+    this.initSubmodules(entry, step, warn);
     this.requireReview(entry, trashDir);
   }
 

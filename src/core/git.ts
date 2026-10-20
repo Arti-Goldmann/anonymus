@@ -43,18 +43,19 @@ const OWN_PATHS = [`${SERVICE_DIR}/`, "anonymus.yaml", ".anonymus.yaml"];
 export class Git {
   constructor(readonly cwd: string) {}
 
-  private run(args: string[]): string {
-    return this.exec(args).toString("utf8").trimEnd();
+  private run(args: string[], env?: NodeJS.ProcessEnv): string {
+    return this.exec(args, env).toString("utf8").trimEnd();
   }
 
   /** Run git and return raw stdout (file contents are binary-safe). */
-  private exec(args: string[]): Buffer {
+  private exec(args: string[], env?: NodeJS.ProcessEnv): Buffer {
     try {
       return execFileSync("git", args, {
         cwd: this.cwd,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
         maxBuffer: 256 * 1024 * 1024,
+        env: env ? { ...process.env, ...env } : undefined,
       });
     } catch (e) {
       const err = e as { stderr?: Buffer; stdout?: Buffer; code?: string; message: string };
@@ -219,6 +220,20 @@ export class Git {
   /** Remove a worktree; `force` also discards its uncommitted changes. */
   worktreeRemove(dir: string, force = false): void {
     this.run(["worktree", "remove", ...(force ? ["--force"] : []), dir]);
+  }
+
+  /** Does this checkout declare submodules (.gitmodules)? */
+  hasSubmodules(): boolean {
+    return fs.existsSync(path.join(this.cwd, ".gitmodules"));
+  }
+
+  /**
+   * Check out the submodules (recursively): `git worktree add` leaves their
+   * folders empty. They are cloned from the URLs in .gitmodules; git must not
+   * stop to ask for a password in a terminal nobody sees.
+   */
+  submoduleUpdate(): void {
+    this.run(["submodule", "update", "--init", "--recursive"], { GIT_TERMINAL_PROMPT: "0" });
   }
 
   /** Forget worktrees whose folders are gone. */
