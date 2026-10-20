@@ -410,7 +410,7 @@ export function App({
     async (name: string, force: boolean): Promise<ActionResult> => {
       await stopPair(name);
       try {
-        const { trashDir, warnings: w } = workspace.remove(name, { force }, (m) => info(m, name));
+        const { trashDir, warnings: w } = await workspace.remove(name, { force }, (m) => info(m, name));
         w.forEach((m) => warn(m, name));
         engines.current.delete(name);
         syncList();

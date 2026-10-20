@@ -154,6 +154,21 @@ describe("config loader", () => {
       expect(problems).toContain("внутри проекта");
     }
   });
+
+  it("allows worktrees_dir inside the project, but not the project itself or its service folders", () => {
+    bench = makeBench();
+    const yaml = (wt: string) =>
+      `sandboxes_dir: ../sandboxes\nworktrees_dir: ${wt}\nsync:\n  include: ["**"]\nreplacements: []\n`;
+    const file = path.join(bench.project, "anonymus.yaml");
+
+    bench.write("project", "anonymus.yaml", yaml(".worktrees"));
+    expect(loadConfig(file).config.worktreesDir).toBe(path.join(bench.project, ".worktrees"));
+
+    for (const bad of [".", ".anonymus/wt", ".git/wt"]) {
+      bench.write("project", "anonymus.yaml", yaml(bad));
+      expect(() => loadConfig(file), bad).toThrow(ConfigError);
+    }
+  });
 });
 
 describe("SyncEngine", () => {

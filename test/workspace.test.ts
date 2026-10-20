@@ -108,7 +108,7 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     const ws = setup();
     const e = await ws.create("feature");
     await reconcilePair(ws, "feature");
-    const { trashDir } = ws.remove("feature");
+    const { trashDir } = await ws.remove("feature");
     expect(fs.existsSync(e.worktree)).toBe(false);
     expect(fs.existsSync(e.sandbox)).toBe(false);
     expect(fs.existsSync(path.join(trashDir, path.basename(e.sandbox), "MyProject", "main.c"))).toBe(true);
@@ -123,10 +123,10 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "main.c"), "int v = 9;\n");
     fs.writeFileSync(path.join(e.worktree, "BIGcorpProject", "new.c"), "// new\n");
     expect(ws.uncommitted("feature")).toHaveLength(2);
-    expect(() => ws.remove("feature")).toThrow(/незакоммиченные изменения/);
+    await expect(ws.remove("feature")).rejects.toThrow(/незакоммиченные изменения/);
     expect(fs.existsSync(e.worktree)).toBe(true);
 
-    const { trashDir } = ws.remove("feature", { force: true });
+    const { trashDir } = await ws.remove("feature", { force: true });
     expect(fs.readFileSync(path.join(trashDir, "worktree", "BIGcorpProject", "main.c"), "utf8")).toBe("int v = 9;\n");
     expect(fs.readFileSync(path.join(trashDir, "worktree", "BIGcorpProject", "new.c"), "utf8")).toBe("// new\n");
     expect(fs.existsSync(e.worktree)).toBe(false);
@@ -148,6 +148,69 @@ describe("Workspace: a git worktree per sub-sandbox", () => {
     // Simulate another live process holding the lock.
     fs.writeFileSync(path.join(dir, "lock"), String(process.ppid));
     expect(acquireLock(dir)).toEqual({ heldBy: process.ppid });
+  });
+});
+
+describe("Workspace: worktrees inside the project, removal on Windows", () => {
+  let bench: Bench;
+  afterEach(() => bench?.cleanup());
+
+  function setup(inside: boolean): Workspace {
+    bench = makeBench();
+    bench.write("project", "BIGcorpProject/main.c", "int v = 1; // BIGcorpProject\n");
+    bench.write("project", ".gitignore", "anonymus.yaml\n.anonymus/\n");
+    bench.gitInit();
+    const config = bench.config();
+    return new Workspace(inside ? { ...config, worktreesDir: path.join(bench.project, ".worktrees") } : config);
+  }
+
+  it("keeps worktrees in the project's .worktrees, hidden from git without touching .gitignore", async () => {
+    const ws = setup(true);
+    const e = await ws.create("feature");
+    expect(e.worktree).toBe(path.join(bench.project, ".worktrees", "feature"));
+    expect(ws.problems()).toEqual([]);
+    expect(ws.check("feature", false)).toBeNull();
+    // The main folder stays clean in git; only the local exclude list knows the folder.
+    expect(bench.git("status", "--porcelain")).toBe("");
+    expect(bench.read("project", ".gitignore")).toBe("anonymus.yaml\n.anonymus/\n");
+    expect(fs.readFileSync(path.join(bench.project, ".git", "info", "exclude"), "utf8")).toContain("/.worktrees/");
+
+    await reconcilePair(ws, "feature");
+    expect(fs.readFileSync(path.join(e.sandbox, "MyProject", "main.c"), "utf8")).toBe("int v = 1; // MyProject\n");
+    await ws.create("second"); // the exclude line is not added twice
+    expect(fs.readFileSync(path.join(bench.project, ".git", "info", "exclude"), "utf8").split("/.worktrees/")).toHaveLength(2);
+
+    await ws.remove("feature");
+    expect(fs.existsSync(e.worktree)).toBe(false);
+  });
+
+  it("finishes a worktree whose files were deleted while its folder stayed (Windows)", async () => {
+    const ws = setup(false);
+    const e = await ws.create("feature");
+    // What a removal blocked by another program leaves behind: an empty folder, still registered.
+    for (const name of fs.readdirSync(e.worktree)) {
+      fs.rmSync(path.join(e.worktree, name), { recursive: true, force: true });
+    }
+    expect(ws.check("feature", false)?.code).toBe("not-worktree");
+    await ws.remove("feature");
+    expect(fs.existsSync(e.worktree)).toBe(false);
+    expect(bench.git("worktree", "list").split("\n")).toHaveLength(1);
+    expect(ws.pairs()).toEqual([]);
+  });
+
+  it.runIf(process.platform === "win32")("waits while another program holds the worktree folder open", async () => {
+    const ws = setup(false);
+    const e = await ws.create("feature");
+    // A process whose current folder is the worktree keeps Windows from deleting it.
+    const { spawn } = await import("node:child_process");
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 2500)"], { cwd: e.worktree });
+    await new Promise((r) => setTimeout(r, 300));
+    const steps: string[] = [];
+    await ws.remove("feature", {}, (m) => steps.push(m));
+    expect(steps.some((s) => s.includes("занята другой программой"))).toBe(true);
+    expect(fs.existsSync(e.worktree)).toBe(false);
+    expect(bench.git("worktree", "list").split("\n")).toHaveLength(1);
+    holder.kill();
   });
 });
 
@@ -212,11 +275,11 @@ describe("Workspace: submodules", () => {
 
     // An edit inside the submodule counts as uncommitted work of the pair.
     fs.writeFileSync(path.join(e.worktree, "CoodEdit", "xml_DB", "TextBase.xml"), "<base edited/>\n");
-    expect(() => ws.remove("feature")).toThrow(/незакоммиченные изменения/);
+    await expect(ws.remove("feature")).rejects.toThrow(/незакоммиченные изменения/);
 
     // git refuses `worktree remove` with submodules unless forced — removing the pair still works,
     // and the edited submodule is kept in the trash.
-    const { trashDir } = ws.remove("feature", { force: true });
+    const { trashDir } = await ws.remove("feature", { force: true });
     expect(fs.existsSync(e.worktree)).toBe(false);
     expect(bench.git("worktree", "list").split("\n")).toHaveLength(1);
     expect(fs.readFileSync(path.join(trashDir, "worktree", "CoodEdit", "xml_DB", "TextBase.xml"), "utf8")).toBe(
@@ -227,7 +290,7 @@ describe("Workspace: submodules", () => {
   it("removes a clean pair with submodules without asking for force", async () => {
     const { ws } = setup();
     const e = await ws.create("feature");
-    ws.remove("feature");
+    await ws.remove("feature");
     expect(fs.existsSync(e.worktree)).toBe(false);
   });
 

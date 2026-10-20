@@ -7,6 +7,7 @@ import {
   CONFIG_FILENAMES,
   DEFAULT_BINARY,
   ReplacementRule,
+  SERVICE_DIR,
   SyncRules,
 } from "./schema.js";
 import {
@@ -228,8 +229,10 @@ export function loadConfig(configPath: string): LoadResult {
     }
   }
 
-  // Git worktrees of the sub-sandboxes: next to the project, never inside it
-  // (builds and searches in the project would see every file several times).
+  // Git worktrees of the sub-sandboxes: next to the project by default. A
+  // folder inside the project (e.g. `.worktrees`) is allowed too — the main
+  // folder is never synced, and anonymus hides it from git (.git/info/exclude);
+  // tools that scan the project recursively will see the copies, though.
   let worktreesDir = path.join(path.dirname(projectRoot), `${path.basename(projectRoot)}.worktrees`);
   if (raw.worktrees_dir !== undefined) {
     if (typeof raw.worktrees_dir !== "string" || raw.worktrees_dir.trim() === "") {
@@ -238,8 +241,10 @@ export function loadConfig(configPath: string): LoadResult {
       worktreesDir = path.resolve(projectRoot, raw.worktrees_dir.trim());
     }
   }
-  if (isInside(worktreesDir, projectRoot) || isInside(projectRoot, worktreesDir)) {
-    problems.push(`worktrees_dir: папка worktree (${worktreesDir}) не может лежать внутри проекта или содержать его.`);
+  if (isInside(projectRoot, worktreesDir)) {
+    problems.push(`worktrees_dir: папка worktree (${worktreesDir}) не может быть папкой проекта или содержать её.`);
+  } else if (isInside(worktreesDir, path.join(projectRoot, SERVICE_DIR)) || isInside(worktreesDir, path.join(projectRoot, ".git"))) {
+    problems.push(`worktrees_dir: ${worktreesDir} — служебная папка, выберите другую (например, .worktrees).`);
   }
   // Sandboxes must never end up inside the worktrees (or a worktree inside a
   // sandbox). Worktrees next to the sandboxes in one parent folder are fine.

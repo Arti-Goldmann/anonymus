@@ -247,8 +247,8 @@ export class Git {
   }
 
   /** Remove a worktree; `force` also discards its uncommitted changes. */
-  worktreeRemove(dir: string, force = false): void {
-    this.run(["worktree", "remove", ...(force ? ["--force"] : []), dir]);
+  async worktreeRemove(dir: string, force = false): Promise<void> {
+    await this.runAsync(["worktree", "remove", ...(force ? ["--force"] : []), dir]);
   }
 
   /** Does this checkout declare submodules (.gitmodules)? */

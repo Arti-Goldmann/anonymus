@@ -196,8 +196,9 @@ export class Workspace {
       ["worktree", this.worktreeFor(n)],
       ["песочницы", sandbox],
     ] as const) {
-      if (isInside(folder, this.config.projectRoot)) {
-        return `папка ${label} ${folder} оказалась бы внутри проекта — проверьте sandboxes_dir / worktrees_dir`;
+      // Worktrees may live inside the project (in worktrees_dir); sandboxes never.
+      if (label === "песочницы" && isInside(folder, this.config.projectRoot)) {
+        return `папка песочницы ${folder} оказалась бы внутри проекта — проверьте sandboxes_dir`;
       }
       if (fs.existsSync(folder) && fs.readdirSync(folder).length > 0) {
         return `папка ${label} ${folder} уже существует и не пуста`;
@@ -242,6 +243,7 @@ export class Workspace {
       base = from === "HEAD" ? null : { branch: from, commit };
     }
     const worktree = this.worktreeFor(n);
+    this.hideWorktreesFromGit();
     step(`git worktree add ${worktree}`);
     try {
       fs.mkdirSync(path.dirname(worktree), { recursive: true });
@@ -361,11 +363,11 @@ export class Workspace {
    * copied to the trash first), the branch stays. A folder that is not the
    * pair's worktree is never touched.
    */
-  remove(
+  async remove(
     name: string,
     options: { force?: boolean } = {},
     step: StepReporter = () => {}
-  ): { trashDir: string; warnings: string[] } {
+  ): Promise<{ trashDir: string; warnings: string[] }> {
     const entry = this.entry(name);
     const git = this.git!;
     const warnings: string[] = [];
@@ -398,7 +400,14 @@ export class Workspace {
       step(`git worktree remove ${entry.worktree}`);
       // git refuses to remove a worktree with submodules unless forced; any
       // uncommitted work in it was refused above or backed up just now.
-      git.worktreeRemove(entry.worktree, dirty.length > 0 || wtGit.hasSubmodules());
+      const left = await this.removeWorktreeFolder(entry, dirty.length > 0 || wtGit.hasSubmodules(), trashDir, step);
+      if (left) {
+        warnings.push(left);
+      }
+    } else if (problem.code === "not-worktree" && this.halfRemoved(entry)) {
+      // An earlier removal deleted the files, but Windows kept the folder open.
+      step(`дочищаю наполовину удалённый worktree ${entry.worktree}`);
+      this.finishHalfRemoved(entry, trashDir);
     } else if (problem.code === "worktree-missing" || problem.code === "sandbox-missing") {
       git.worktreePrune();
     } else {
@@ -413,6 +422,101 @@ export class Workspace {
     this.registry!.remove(entry.name);
     this.registry!.save();
     return { trashDir, warnings };
+  }
+
+  /**
+   * `git worktree remove`, patient with Windows: a folder another program
+   * holds open (VS Code, a terminal, Explorer) cannot be deleted. git then has
+   * often removed the files already, but not the folder and its registration —
+   * that half-removed state is finished here, and the attempt is repeated a
+   * few times before giving up with an explanation.
+   */
+  private async removeWorktreeFolder(
+    entry: SandboxEntry,
+    force: boolean,
+    trashDir: string,
+    step: StepReporter
+  ): Promise<string | null> {
+    const git = this.git!;
+    const attempts = 4;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        if (this.halfRemoved(entry)) {
+          this.finishHalfRemoved(entry, trashDir);
+        } else if (this.leftoverFolder(entry)) {
+          // git removed the files and the registration, only the folder stayed.
+          moveDir(entry.worktree, uniquePath(path.join(trashDir, "worktree-left")));
+        } else {
+          await git.worktreeRemove(entry.worktree, force);
+        }
+        return null;
+      } catch (e) {
+        const message = (e as Error).message;
+        const busy = /permission denied|resource busy|used by another process|занята|invalid argument|not a working tree/i.test(message);
+        if (!busy) {
+          throw e;
+        }
+        if (attempt >= attempts) {
+          if (this.leftoverFolder(entry)) {
+            // The worktree itself is gone; only an empty-ish folder is still held open.
+            return `папка ${entry.worktree} осталась (её держит открытой другая программа) — удалите её, когда закроете`;
+          }
+          throw new Error(
+            `папку ${entry.worktree} держит открытой другая программа (VS Code, терминал, проводник) — ` +
+              "закройте её там и удалите подпесочницу ещё раз; песочница и ветка не тронуты"
+          );
+        }
+        step(`папка worktree занята другой программой, повторяю (${attempt}/${attempts - 1})…`);
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    }
+  }
+
+  /** The worktree folder is still there, but git no longer knows it (and it has no `.git`). */
+  private leftoverFolder(entry: SandboxEntry): boolean {
+    if (!fs.existsSync(entry.worktree) || readWorktreeLink(entry.worktree).kind !== "missing") {
+      return false;
+    }
+    const wt = path.resolve(entry.worktree).toLowerCase();
+    return !this.git!.worktreeList().some((w) => path.resolve(w.path).toLowerCase() === wt);
+  }
+
+  /**
+   * Worktrees kept inside the project (worktrees_dir: .worktrees) would show
+   * up in the main folder's `git status` as new files. They are hidden in the
+   * repository's local exclude list (.git/info/exclude) — not in .gitignore,
+   * so no tracked file of the project changes.
+   */
+  private hideWorktreesFromGit(): void {
+    const dir = this.config.worktreesDir;
+    const root = this.config.projectRoot;
+    if (!isInside(dir, root) || !this.commonGitDir) {
+      return;
+    }
+    const pattern = `/${path.relative(root, dir).split(path.sep).join("/")}/`;
+    const file = path.join(this.commonGitDir, "info", "exclude");
+    const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    if (existing.split(/\r?\n/).some((l) => l.trim() === pattern)) {
+      return;
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+    fs.appendFileSync(file, `${prefix}# anonymus: git worktree подпесочниц\n${pattern}\n`);
+  }
+
+  /** The pair's worktree folder lost its files (and `.git`) but git still has it registered. */
+  private halfRemoved(entry: SandboxEntry): boolean {
+    return (
+      fs.existsSync(entry.worktree) &&
+      readWorktreeLink(entry.worktree).kind === "missing" &&
+      path.resolve(findMarkedWorktree(this.commonGitDir!, entry.worktreeId) ?? "") === path.resolve(entry.worktree)
+    );
+  }
+
+  /** Move whatever is left of a half-removed worktree to the trash and drop its registration. */
+  private finishHalfRemoved(entry: SandboxEntry, trashDir: string): void {
+    moveDir(entry.worktree, uniquePath(path.join(trashDir, "worktree-left")));
+    this.git!.worktreePrune();
   }
 
   // --- recovering from a problem --------------------------------------------
@@ -439,6 +543,7 @@ export class Workspace {
     if (taken) {
       throw new Error(`ветка ${entry.branch} выбрана в ${taken.path} — освободите её там`);
     }
+    this.hideWorktreesFromGit();
     step(`git worktree add ${entry.worktree} ${entry.branch}`);
     fs.mkdirSync(path.dirname(entry.worktree), { recursive: true });
     await git.worktreeAdd(entry.worktree, entry.branch);

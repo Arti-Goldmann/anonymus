@@ -13,7 +13,10 @@ version: 1
 # путь; не внутри проекта):
 sandboxes_dir: ../sandboxes
 # Куда класть их git worktree. По умолчанию — рядом с проектом: <проект>.worktrees.
+# Можно и внутри проекта (.worktrees — anonymus скроет её от git), но тогда
+# исключите её из сборки, если та собирает все исходники в папке проекта.
 # worktrees_dir: ../proj.worktrees
+# worktrees_dir: .worktrees
 
 # Проект без git: одна песочница, синхронизируется сама папка проекта.
 # sandbox: ../sandbox1

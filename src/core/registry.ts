@@ -123,13 +123,15 @@ export class Registry {
     const list = this.data.sandboxes;
     const project = this.config.projectRoot;
     for (const e of list) {
-      for (const [label, dir] of [
-        ["worktree", e.worktree],
-        ["песочница", e.sandbox],
-      ] as const) {
-        if (isInside(dir, project) || isInside(project, dir)) {
-          problems.push(`«${e.name}»: ${label} ${dir} пересекается с папкой проекта`);
-        }
+      // A worktree may live inside the project only in worktrees_dir; a sandbox never.
+      const worktreeMisplaced =
+        isInside(project, e.worktree) ||
+        (isInside(e.worktree, project) && !isInside(e.worktree, this.config.worktreesDir));
+      if (worktreeMisplaced) {
+        problems.push(`«${e.name}»: worktree ${e.worktree} пересекается с папкой проекта`);
+      }
+      if (isInside(e.sandbox, project) || isInside(project, e.sandbox)) {
+        problems.push(`«${e.name}»: песочница ${e.sandbox} пересекается с папкой проекта`);
       }
       if (isInside(e.sandbox, e.worktree) || isInside(e.worktree, e.sandbox)) {
         problems.push(`«${e.name}»: песочница и worktree лежат одна в другой`);

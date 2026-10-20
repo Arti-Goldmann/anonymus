@@ -329,7 +329,7 @@ async function runSandboxCommand(workspace: Workspace, action: SandboxAction, na
       await workspace.create(name, { from: args.from }, step, (m) => console.log(`⚠ ${m}`));
       console.log("готово. Запустите anonymus — песочница заполнится из worktree.");
     } else {
-      const { warnings } = workspace.remove(name, { force: args.force }, step);
+      const { warnings } = await workspace.remove(name, { force: args.force }, step);
       warnings.forEach((w) => console.log(`⚠ ${w}`));
       console.log("готово.");
     }
