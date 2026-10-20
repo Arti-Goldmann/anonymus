@@ -13,6 +13,8 @@ import { RegistryFormatError } from "./core/registry.js";
 import { applyReconcile, planReconcile, type Strategy } from "./core/reconcile.js";
 import { KIND_LABEL, scan } from "./core/scanner.js";
 import { Syncer } from "./core/syncer.js";
+import { decodeText } from "./core/fileio.js";
+import { Transformer } from "./core/transformer.js";
 import { Workspace } from "./core/workspace.js";
 import { App } from "./ui/App.js";
 import { flickerFreeStdout } from "./ui/frameStdout.js";
@@ -26,6 +28,8 @@ const HELP = `anonymus — автоматическая синхронизаци
   anonymus              проверка, сверка и живая синхронизация всех подпесочниц
   anonymus init         создать anonymus.yaml из шаблона
   anonymus scan         только показать расхождения (код 1, если они есть)
+  anonymus check "<текст>"        как текст будет выглядеть в песочнице: результат и сработавшие правила
+  anonymus check --file <путь>    то же для файла: изменённые строки и найденные утечки
 
 Подпесочницы (git-проект: у каждой своя ветка и свой git worktree рядом с проектом):
   anonymus sandboxes                    список и состояние
@@ -55,7 +59,10 @@ const HELP = `anonymus — автоматическая синхронизаци
 type SandboxAction = "new" | "remove";
 
 interface Args {
-  command: "start" | "init" | "scan" | "sandboxes" | "sandbox" | "merge" | "commit";
+  command: "start" | "init" | "scan" | "sandboxes" | "sandbox" | "merge" | "commit" | "check";
+  /** check: a text to try, or a file with --file. */
+  checkText?: string;
+  checkFile?: string;
   sandboxAction?: SandboxAction;
   name?: string;
   from?: string;
@@ -90,6 +97,17 @@ function parseArgs(argv: string[]): Args {
     const a = argv[i];
     if (a === "init" || a === "scan" || a === "sandboxes") {
       args.command = a;
+    } else if (a === "check") {
+      args.command = "check";
+      if (argv[i + 1] === "--file") {
+        i++;
+        args.checkFile = argv[++i];
+      } else {
+        args.checkText = argv[++i];
+      }
+      if (!args.checkFile && args.checkText === undefined) {
+        fail('check: укажите текст в кавычках или --file <путь>');
+      }
     } else if (a === "sandbox") {
       const action = argv[++i];
       const name = argv[++i];
@@ -224,6 +242,64 @@ async function runScan(workspace: Workspace): Promise<void> {
     clean &&= result.clean;
   }
   process.exit(clean ? 0 : 1);
+}
+
+/** Show characters that look alike but are not: no-break spaces, typographic quotes, tabs. */
+function visible(s: string): string {
+  return s.replace(/[   ]/g, "⍽").replace(/\t/g, "→");
+}
+
+/**
+ * `anonymus check`: how a text or a file looks after anonymization with the
+ * current anonymus.yaml — to find out why a name was (not) replaced without
+ * starting a sync.
+ */
+function runCheck(workspace: Workspace, args: Args): void {
+  const t = new Transformer(workspace.config.replacements);
+  let text: string;
+  if (args.checkFile) {
+    const file = path.resolve(args.checkFile);
+    if (!fs.existsSync(file)) {
+      fail(`нет файла ${file}`, 1);
+    }
+    const decoded = decodeText(fs.readFileSync(file), workspace.config.sync.encoding);
+    console.log(`файл ${file}: кодировка ${decoded.encoding}${decoded.bom ? " + BOM" : ""}, концы строк ${decoded.eol === "\r\n" ? "CRLF" : "LF"}`);
+    text = decoded.text;
+  } else {
+    text = args.checkText!;
+  }
+  const result = t.anonymize(text);
+  if (args.checkFile) {
+    const before = text.split(/\r?\n/);
+    const after = result.text.split(/\r?\n/);
+    if (before.length === after.length) {
+      before.forEach((line, i) => {
+        if (line !== after[i]) {
+          console.log(`  ${String(i + 1).padStart(5)}  − ${visible(line)}`);
+          console.log(`         + ${visible(after[i])}`);
+        }
+      });
+    } else {
+      console.log("  (многострочные замены изменили число строк — построчное сравнение не показываю)");
+    }
+  } else {
+    console.log(`было:  ${visible(text)}`);
+    console.log(`стало: ${visible(result.text)}`);
+  }
+  if (result.applied.length === 0) {
+    console.log("ни одно правило не сработало");
+  }
+  for (const a of result.applied) {
+    console.log(`сработало ×${a.count}: ${JSON.stringify(a.from)} → ${JSON.stringify(a.to)}`);
+  }
+  const leaks = t.findLeaks(result.text);
+  for (const leak of leaks) {
+    console.log(`⚠ осталось реальное имя: ${JSON.stringify(leak)}`);
+  }
+  if (/[   «»„“”]/.test(text)) {
+    console.log("в тексте есть неразрывные пробелы (⍽) или типографские кавычки «» “” — правило должно содержать ровно их");
+  }
+  process.exit(leaks.length > 0 ? 1 : 0);
 }
 
 function printSandboxes(workspace: Workspace): void {
@@ -375,6 +451,10 @@ async function main(): Promise<void> {
 
   if (args.command === "scan") {
     await runScan(workspace);
+    return;
+  }
+  if (args.command === "check") {
+    runCheck(workspace, args);
     return;
   }
   if (args.command === "sandboxes") {
