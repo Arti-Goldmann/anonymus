@@ -267,7 +267,7 @@ replacements:
 ```powershell
 anonymus scan                              # только отчёт о расхождениях (код 1, если они есть)
 anonymus check "ООО МИП \"Ромашка\""       # как строка будет выглядеть в песочнице и какие правила сработали
-anonymus check --file srcmain.c          # то же для файла: изменённые строки, кодировка, утечки
+anonymus check --file src\main.c         # то же для файла: изменённые строки, кодировка, утечки
 anonymus --no-tui --strategy smart         # построчный лог без интерфейса, все пары
 anonymus -c D:\proj\anonymus.yaml          # конфиг не из текущей папки
 anonymus sandboxes                         # подпесочницы и их состояние
