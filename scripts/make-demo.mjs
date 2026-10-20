@@ -21,10 +21,12 @@ const sandboxes = path.join(root, "sandboxes");
  * Empty a folder but keep the folder itself: it may be the current directory
  * of a terminal or open in VS Code, and Windows refuses to delete such folders.
  */
-function clearDir(dir) {
+function clearDir(dir, keep = []) {
   fs.mkdirSync(dir, { recursive: true });
   for (const name of fs.readdirSync(dir)) {
-    forceRm(path.join(dir, name));
+    if (!keep.includes(name)) {
+      forceRm(path.join(dir, name));
+    }
   }
 }
 
@@ -54,7 +56,10 @@ for (const name of fs.readdirSync(root)) {
 }
 clearDir(proj);
 clearDir(worktrees);
-clearDir(sandboxes);
+// The agents' container setup (Dockerfile + devcontainer.json) lives next to
+// the sandboxes and survives a reset: open demo/sandboxes in VS Code and
+// "Reopen in Container" — the agents then see every sandbox, placeholders only.
+clearDir(sandboxes, [".devcontainer"]);
 
 const crlf = (s) => s.replace(/\n/g, "\r\n");
 function write(rel, content) {
@@ -239,4 +244,8 @@ console.log(`Демо-стенд создан: ${root}
 
 Дальше:
   code "${path.join(root, "demo.code-workspace")}"
-  & "${path.join(root, "start.ps1")}"     затем n — первая подпесочница`);
+  & "${path.join(root, "start.ps1")}"     затем n — первая подпесочница${
+  fs.existsSync(path.join(sandboxes, ".devcontainer"))
+    ? `\n  агенты в контейнере: откройте ${sandboxes} в VS Code → Dev Containers: Reopen in Container`
+    : ""
+}`);
