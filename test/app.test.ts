@@ -78,7 +78,8 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
     // n → name → Enter: branch + worktree + sandbox, filled and synced right away.
     press("n");
     await until(() => out.screen.includes("Имя новой подпесочницы"), "name input");
-    press("feature-x");
+    // Typed fast, one key at a time, with a backspace: no letter may get lost.
+    for (const ch of "feature-xy\x7f") press(ch);
     await until(() => /sandboxes[\\/]feature-x/.test(out.screen), "preview of the folders");
     press("\r");
     await until(() => out.screen.includes("feature-x") && out.screen.includes("синхронно"), "pair live");
@@ -136,6 +137,7 @@ describe("App: pairs of sub-sandbox ⇄ worktree", () => {
       bench.write("project", `BIGcorpProject/f${String(i).padStart(2, "0")}.c`, `int f${i};\n`);
     }
     await until(() => out.screen.includes("MyProject/f39.c"), "newest transfer shown");
+    await until(() => out.screen.includes("синхронно"), "all transfers done"); // no new lines while scrolling
 
     press("\x1b[<64;5;5M\x1b[<64;5;5M"); // wheel up, two notches
     await until(() => out.screen.includes("история: ниже"), "scrolled back");

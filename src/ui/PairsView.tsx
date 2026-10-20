@@ -1,19 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput, type DOMElement } from "ink";
 import Spinner from "ink-spinner";
-import TextInput from "ink-text-input";
 import { defaultMergeSources } from "../core/mergePrep.js";
 import type { PairProblem, ProblemCode } from "../core/pairGuard.js";
 import type { SyncEvent } from "../core/syncer.js";
 import { hits, mouseBus } from "./mouse.js";
 import type { Workspace } from "../core/workspace.js";
 import { EventLine } from "./EventLine.js";
+import { LineInput } from "./LineInput.js";
 import type { ActionResult, PairView } from "./pairState.js";
 import { plural, theme } from "./theme.js";
 
 type Mode =
   | { kind: "list" }
-  | { kind: "new"; value: string; base: number; error: string | null }
+  /** `bases` / `branches` are read from git once, when the input opens — never per keystroke. */
+  | { kind: "new"; value: string; base: number; error: string | null; bases: string[]; branches: Set<string> }
   | { kind: "confirm-delete"; name: string; uncommitted: number }
   | { kind: "confirm-abort"; name: string }
   | { kind: "merge"; target: string; sources: string[]; picked: Set<string>; index: number }
@@ -69,7 +70,6 @@ export function PairsView({
   onTrash: () => void;
   onQuit: () => void;
 }) {
-  const bases = workspace.baseBranchChoices();
   const [index, setIndex] = useState(0);
   const [mode, setMode] = useState<Mode>({ kind: "list" });
   const [result, setResult] = useState<ActionResult | null>(null);
@@ -220,7 +220,14 @@ export function PairsView({
         onTrash();
       } else if ((input === "n" || input === "т") && needGit()) {
         setResult(null);
-        setMode({ kind: "new", value: "", base: 0, error: null });
+        setMode({
+          kind: "new",
+          value: "",
+          base: 0,
+          error: null,
+          bases: workspace.baseBranchChoices(),
+          branches: new Set(workspace.git?.listBranches() ?? []),
+        });
       } else if ((input === "d" || input === "в") && selected && needGit()) {
         setResult(null);
         setMode({ kind: "confirm-delete", name: selected.name, uncommitted: workspace.uncommitted(selected.name).length });
@@ -246,14 +253,14 @@ export function PairsView({
     (_input, key) => {
       if (key.escape) {
         setMode({ kind: "list" });
-      } else if (key.tab && mode.kind === "new" && bases.length > 1) {
-        setMode({ ...mode, base: (mode.base + 1) % bases.length });
+      } else if (key.tab && mode.kind === "new" && mode.bases.length > 1) {
+        setMode({ ...mode, base: (mode.base + 1) % mode.bases.length });
       }
     },
     { isActive: mode.kind === "new" || mode.kind === "commit" }
   );
 
-  const from = mode.kind === "new" ? bases[mode.base] ?? "HEAD" : "";
+  const from = mode.kind === "new" ? mode.bases[mode.base] ?? "HEAD" : "";
   const newName = mode.kind === "new" ? mode.value.trim() : "";
   // The log gets whatever the list, the action area and the key hints leave.
   const listRows = Math.max(1, Math.min(pairs.length, maxItems)) + (pairs.length > maxItems ? 1 : 0);
@@ -326,13 +333,12 @@ export function PairsView({
         <Box flexDirection="column" paddingX={1} flexShrink={0}>
           <Box>
             <Text color={theme.accent}>Имя новой подпесочницы (= ветки): </Text>
-            <TextInput
-              value={mode.value}
-              onChange={(value) => setMode({ ...mode, value, error: null })}
+            <LineInput
+              onChange={(value) => setMode((m) => (m.kind === "new" ? { ...m, value, error: null } : m))}
               onSubmit={(value) => {
                 const error = workspace.validateNewName(value);
                 if (error) {
-                  setMode({ ...mode, value, error });
+                  setMode((m) => (m.kind === "new" ? { ...m, value, error } : m));
                 } else {
                   const name = value.trim();
                   runAsync(`создаю «${name}»`, () => onCreate(name, from));
@@ -340,13 +346,13 @@ export function PairsView({
               }}
             />
           </Box>
-          {newName && workspace.isExistingBranch(newName) ? (
+          {newName && mode.branches.has(newName) ? (
             <Text color={theme.muted}>ветка {newName} уже есть — подпесочница возьмёт её</Text>
           ) : (
             <Text>
               <Text color={theme.muted}>от ветки: </Text>
               <Text bold>{from}</Text>
-              {bases.length > 1 && <Text color={theme.muted}>   (Tab — другая)</Text>}
+              {mode.bases.length > 1 && <Text color={theme.muted}>   (Tab — другая)</Text>}
             </Text>
           )}
           {newName && (
@@ -386,9 +392,8 @@ export function PairsView({
         <Box flexDirection="column" paddingX={1} flexShrink={0}>
           <Box>
             <Text color={theme.accent}>Коммит в {pairs.find((p) => p.name === mode.name)?.branch}: </Text>
-            <TextInput
-              value={mode.value}
-              onChange={(value) => setMode({ ...mode, value })}
+            <LineInput
+              initial={mode.value}
               onSubmit={(value) => {
                 show(onCommit(mode.name, value.trim() || workspace.defaultCommitMessage(mode.name)));
                 setMode({ kind: "list" });
