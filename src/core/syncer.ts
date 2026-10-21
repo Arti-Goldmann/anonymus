@@ -92,6 +92,8 @@ export class Syncer extends EventEmitter<SyncerEvents> {
   private guardTimer: NodeJS.Timeout | null = null;
   private problem: PairProblem | null = null;
   private gitBusySince = 0;
+  /** The last save of the sync record failed (reported once until it works again). */
+  private flushFailed = false;
   /** Recent deletions, by the side the files vanished on. */
   private readonly deletions: Record<Side, number[]> = { project: [], sandbox: [] };
   /** Largest number of files the pair had (deletions shrink the state). */
@@ -154,7 +156,7 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     this.stopGuard();
     await Promise.all(this.watchers.map((w) => w.close()));
     this.watchers = [];
-    this.engine.flush();
+    this.flushSafely();
   }
 
   pause(): void {
@@ -285,7 +287,7 @@ export class Syncer extends EventEmitter<SyncerEvents> {
         // Let the UI render between files during big batches.
         await new Promise<void>((r) => setImmediate(r));
       }
-      this.engine.flush();
+      this.flushSafely();
     } finally {
       this.running = false;
       this.emitState();
@@ -525,7 +527,7 @@ export class Syncer extends EventEmitter<SyncerEvents> {
       return { ok: false, message: (e as Error).message };
     }
     this.held.delete(canonical);
-    this.engine.flush();
+    this.flushSafely();
     this.emit("held", this.getHeld());
     return { ok: true, message: "готово" };
   }
@@ -563,6 +565,27 @@ export class Syncer extends EventEmitter<SyncerEvents> {
     }
     this.reportedPathErrors.add(key);
     this.emitEvent("error", `${side === "project" ? "проект" : "песочница"} ${rel}: ${problem} — файл не синхронизируется`);
+  }
+
+  /**
+   * Save the sync record. A failure (the file held open by another program,
+   * the disk full) must not stop syncing: nothing on either side is lost —
+   * the record is only a memory of what matched — so it is reported and
+   * saved again with the next change.
+   */
+  private flushSafely(): void {
+    try {
+      this.engine.flush();
+      this.flushFailed = false;
+    } catch (e) {
+      if (!this.flushFailed) {
+        this.flushFailed = true;
+        this.emitEvent(
+          "warning",
+          `не удалось сохранить историю синхронизации (${(e as Error).message}) — сохраню при следующем изменении`
+        );
+      }
+    }
   }
 
   private info(message: string): void {

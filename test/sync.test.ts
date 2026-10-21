@@ -170,3 +170,41 @@ describe("live Syncer", () => {
   });
 });
 
+
+describe("live Syncer: the sync record cannot be saved for a moment", () => {
+  let bench: Bench;
+  let syncer: Syncer | null = null;
+  afterEach(async () => {
+    await syncer?.stop();
+    syncer = null;
+    bench?.cleanup();
+  });
+
+  it("keeps syncing and warns once instead of crashing", async () => {
+    bench = makeBench();
+    bench.write("project", "a.c", "int a;\n");
+    const e = bench.engine();
+    await applyReconcile(e, planReconcile(await scan(e), "project-wins"));
+    // As if Windows kept state.json locked: every save fails for now.
+    const realFlush = e.flush.bind(e);
+    let locked = true;
+    e.flush = () => {
+      if (locked) throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
+      realFlush();
+    };
+    const events: SyncEvent[] = [];
+    syncer = new Syncer(e);
+    syncer.on("event", (ev) => events.push(ev));
+    await syncer.start();
+
+    bench.write("sandbox", "a.c", "int a = 1;\n");
+    bench.write("sandbox", "b.c", "int b;\n");
+    await waitFor(() => bench.read("project", "a.c") === "int a = 1;\n" && bench.read("project", "b.c") === "int b;\n");
+    const warnings = events.filter((ev) => ev.kind === "warning" && ev.message.includes("историю синхронизации"));
+    expect(warnings).toHaveLength(1);
+
+    locked = false; // the lock is gone: the next change saves normally
+    bench.write("sandbox", "c.c", "int c;\n");
+    await waitFor(() => bench.read("project", "c.c") === "int c;\n");
+  });
+});

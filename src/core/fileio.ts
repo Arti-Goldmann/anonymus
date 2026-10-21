@@ -131,3 +131,35 @@ export function walkFiles(root: string, skipDir: (relDir: string) => boolean): s
   }
   return out.sort();
 }
+
+/** Errors Windows returns while another program has a file open for a moment. */
+const TRANSIENT_LOCK = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/** Block the thread for a few milliseconds (a sync retry loop has no other way). */
+function pause(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Write a file atomically: to `<file>.tmp`, then rename over the file — a
+ * crash never leaves it half written. On Windows the rename fails while an
+ * antivirus, the search indexer or an editor has the target open for a
+ * moment; that is retried for about a second before the error is passed on.
+ */
+export function writeFileAtomic(file: string, data: string | Uint8Array): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, data);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? "";
+      if (!TRANSIENT_LOCK.has(code) || attempt >= 12) {
+        throw e;
+      }
+      pause(Math.min(200, 20 * attempt));
+    }
+  }
+}

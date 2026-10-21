@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SERVICE_DIR } from "../config/schema.js";
+import { writeFileAtomic } from "./fileio.js";
 
 /** What both sides looked like the last time a file was in sync. */
 export interface SyncEntry {
@@ -61,9 +62,7 @@ export class StateStore {
       profile: this.profile,
       entries: Object.fromEntries([...this.entries].sort(([a], [b]) => a.localeCompare(b))),
     };
-    const tmp = this.file + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
-    fs.renameSync(tmp, this.file);
+    writeFileAtomic(this.file, JSON.stringify(data, null, 2));
   }
 
   get size(): number {

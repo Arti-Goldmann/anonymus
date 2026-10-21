@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { isInside } from "../config/loader.js";
 import { SERVICE_DIR, type AnonymusConfig, type Profile } from "../config/schema.js";
+import { writeFileAtomic } from "./fileio.js";
 
 /** A git merge into this sub-sandbox's branch, run source by source. */
 export interface MergeRun {
@@ -85,10 +86,7 @@ export class Registry {
   }
 
   save(): void {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    const tmp = this.file + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2), "utf8");
-    fs.renameSync(tmp, this.file);
+    writeFileAtomic(this.file, JSON.stringify(this.data, null, 2));
   }
 
   list(): readonly SandboxEntry[] {
